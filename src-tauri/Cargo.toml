@@ -1,0 +1,21 @@
+[package]
+name = "work-token-monitor"
+version = "0.3.0"
+description = "Local token monitor for ChatGPT Work and Codex"
+authors = ["Work Token Monitor contributors"]
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "work_token_monitor_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }
+
+[dependencies]
+tauri = { version = "=2.11.5", features = [] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+chrono = { version = "=0.4.45", default-features = false, features = ["clock"] }
+tauri-plugin-clipboard-manager = "=2.3.3"

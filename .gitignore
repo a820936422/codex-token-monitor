@@ -1,0 +1,17 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/schemas/
+*.log
+*.tsbuildinfo
+.DS_Store
+.env
+.env.*
+!.env.example
+
+src-tauri/icons/*
+!src-tauri/icons/icon.png
+
+# Generated lockfiles are intentionally not versioned
+package-lock.json
+src-tauri/Cargo.lock
