@@ -69,27 +69,36 @@ select:focus { border-color: color-mix(in srgb,var(--accent) 55%,var(--line)); b
 .conversation-context-menu button:hover { background: var(--panel-2); }
 .conversation-context-menu small { display: block; padding: 4px 9px 6px; overflow: hidden; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
 
-.summary { display: grid; grid-template-columns: repeat(4,1fr); gap: 10px; margin: 12px 0; }
+.summary { display: grid; grid-template-columns: repeat(5,minmax(0,1fr)); gap: 10px; margin: 12px 0; }
 .summary > div { min-width: 0; padding: 13px 15px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
 .summary span { display: block; margin-bottom: 6px; color: var(--muted); font-size: 9px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }
 .summary strong { display: block; overflow: hidden; font-size: 18px; text-overflow: ellipsis; white-space: nowrap; }
 .table-card { overflow: hidden; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); }
 .table-scroll { max-height: calc(100vh - 305px); min-height: 360px; overflow: auto; }
-table { width: 100%; min-width: 1120px; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+table { width: 100%; border-collapse: collapse; table-layout: fixed; font-variant-numeric: tabular-nums; }
 thead { position: sticky; top: 0; z-index: 2; background: rgba(18,21,25,.96); backdrop-filter: blur(12px); }
-th { height: 42px; padding: 0 14px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 9px; font-weight: 800; letter-spacing: .08em; text-align: left; text-transform: uppercase; }
+th { position: relative; height: 42px; padding: 0 14px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 9px; font-weight: 800; letter-spacing: .08em; text-align: left; text-transform: uppercase; }
 td { height: 52px; padding: 0 14px; border-bottom: 1px solid rgba(37,43,50,.72); font-size: 12px; white-space: nowrap; }
 tbody tr { transition: background .12s ease; }
 tbody tr:hover { background: rgba(255,255,255,.025); }
 tbody tr:last-child td { border-bottom: 0; }
 .numeric { text-align: right; }
+.resizable-header { user-select: none; }
+.column-resizer { position: absolute; z-index: 4; top: 0; right: -5px; width: 10px; height: 100%; cursor: col-resize; touch-action: none; outline: none; }
+.column-resizer::after { content: ""; position: absolute; top: 8px; bottom: 8px; left: 4px; width: 1px; background: transparent; transition: background .12s ease; }
+.column-resizer:hover::after, .column-resizer:focus-visible::after, body.column-resizing .column-resizer::after { background: color-mix(in srgb,var(--accent) 65%,var(--line)); }
+body.column-resizing, body.column-resizing * { cursor: col-resize !important; user-select: none !important; }
 .time-cell { color: var(--muted); }
-.model-cell { max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
-.project-cell { max-width: 180px; overflow: hidden; color: var(--muted); text-overflow: ellipsis; }
-.plain-filter-button { max-width: 170px; padding: 4px 6px; overflow: hidden; border: 0; border-radius: 6px; color: var(--muted); background: transparent; cursor: pointer; text-overflow: ellipsis; white-space: nowrap; }
+.model-cell { overflow: hidden; }
+.model-stack { min-width: 0; overflow: hidden; }
+.model-stack strong, .model-stack small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-stack strong { font-size: 11px; font-weight: 650; }
+.model-stack small { margin-top: 3px; color: var(--muted); font-size: 8px; font-weight: 700; letter-spacing: .04em; }
+.project-cell { overflow: hidden; color: var(--muted); text-overflow: ellipsis; }
+.plain-filter-button { width: 100%; max-width: 100%; padding: 4px 6px; overflow: hidden; border: 0; border-radius: 6px; color: var(--muted); background: transparent; cursor: pointer; text-overflow: ellipsis; white-space: nowrap; }
 .plain-filter-button:hover { color: var(--text); background: var(--panel-2); }
 .token-input { color: var(--input); } .token-cached { color: var(--cached); } .token-output { color: var(--output); }
-.conversation-button { display: block; max-width: 340px; padding: 4px 7px; overflow: hidden; border: 0; border-radius: 7px; text-align: left; color: var(--text); background: transparent; cursor: pointer; }
+.conversation-button { display: block; width: 100%; max-width: 100%; padding: 4px 7px; overflow: hidden; border: 0; border-radius: 7px; text-align: left; color: var(--text); background: transparent; cursor: pointer; }
 .conversation-button:hover { background: var(--panel-2); }
 .conversation-button strong, .conversation-button small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conversation-button strong { font-size: 11px; font-weight: 620; }

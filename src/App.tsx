@@ -10,12 +10,56 @@ const timeFormat = new Intl.DateTimeFormat(undefined, {
   month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
 });
 
+const COLUMN_WIDTHS_KEY = "wtm.columnWidths";
+const MAX_COLUMN_WIDTH = 720;
+const COLUMN_CONFIG = {
+  time: { defaultWidth: 145, minWidth: 110 },
+  project: { defaultWidth: 170, minWidth: 110 },
+  conversation: { defaultWidth: 320, minWidth: 190 },
+  model: { defaultWidth: 180, minWidth: 130 },
+  input: { defaultWidth: 100, minWidth: 80 },
+  cached: { defaultWidth: 100, minWidth: 80 },
+  output: { defaultWidth: 100, minWidth: 80 },
+  cache: { defaultWidth: 130, minWidth: 120 },
+} as const;
+
+type ColumnKey = keyof typeof COLUMN_CONFIG;
+type ColumnWidths = Record<ColumnKey, number>;
+const columnKeys = Object.keys(COLUMN_CONFIG) as ColumnKey[];
+
 function saved(key: string) {
   try { return localStorage.getItem(key) || ""; } catch { return ""; }
 }
 
 function persist(key: string, value: string) {
   try { localStorage.setItem(key, value); } catch {}
+}
+
+function defaultColumnWidths(): ColumnWidths {
+  return Object.fromEntries(columnKeys.map((key) => [key, COLUMN_CONFIG[key].defaultWidth])) as ColumnWidths;
+}
+
+function clampColumnWidth(key: ColumnKey, width: number) {
+  return Math.max(COLUMN_CONFIG[key].minWidth, Math.min(MAX_COLUMN_WIDTH, Math.round(width)));
+}
+
+function loadColumnWidths(): ColumnWidths {
+  const defaults = defaultColumnWidths();
+  const raw = saved(COLUMN_WIDTHS_KEY);
+  if (!raw) return defaults;
+  try {
+    const parsed = JSON.parse(raw) as Partial<Record<ColumnKey, unknown>>;
+    for (const key of columnKeys) {
+      if (typeof parsed[key] === "number" && Number.isFinite(parsed[key])) {
+        defaults[key] = clampColumnWidth(key, parsed[key]);
+      }
+    }
+  } catch {}
+  return defaults;
+}
+
+function persistColumnWidths(widths: ColumnWidths) {
+  persist(COLUMN_WIDTHS_KEY, JSON.stringify(widths));
 }
 
 export default function App() {
@@ -27,6 +71,7 @@ export default function App() {
   const [sort, setSort] = useState<"desc" | "asc">("desc");
   const [dateFrom, setDateFrom] = useState(() => saved("wtm.dateFrom"));
   const [dateTo, setDateTo] = useState(() => saved("wtm.dateTo"));
+  const [columnWidths, setColumnWidths] = useState<ColumnWidths>(loadColumnWidths);
   const [follow, setFollow] = useState(true);
   const [live, setLive] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; conversationId: string } | null>(null);
@@ -134,6 +179,14 @@ export default function App() {
   const changeDateTo = (value: string) => { setDateTo(value); persist("wtm.dateTo", value); };
   const clearDates = () => { changeDateFrom(""); changeDateTo(""); };
   const clearAllFilters = () => { chooseProject(""); clearDates(); };
+  const resizeColumn = (key: ColumnKey, width: number, save: boolean) => {
+    setColumnWidths((current) => {
+      const next = { ...current, [key]: clampColumnWidth(key, width) };
+      if (save) persistColumnWidths(next);
+      return next;
+    });
+  };
+  const resetColumn = (key: ColumnKey) => resizeColumn(key, COLUMN_CONFIG[key].defaultWidth, true);
 
   const openConversationMenu = (event: React.MouseEvent, id: string) => {
     event.preventDefault();
@@ -163,8 +216,10 @@ export default function App() {
 
   const totalInput = rows.reduce((sum, call) => sum + call.usage.inputTokens, 0);
   const totalCached = rows.reduce((sum, call) => sum + call.usage.cachedInputTokens, 0);
+  const totalTokens = rows.reduce((sum, call) => sum + call.usage.totalTokens, 0);
   const visibleConversations = new Set(rows.map((call) => call.conversationId)).size;
   const newest = rows.reduce<CallRecord | null>((best, call) => !best || call.timestamp > best.timestamp ? call : best, null);
+  const tableWidth = columnKeys.reduce((sum, key) => sum + columnWidths[key], 0);
 
   return (
     <main className="shell">
@@ -188,14 +243,27 @@ export default function App() {
       <section className="summary" aria-label="Summary">
         <div><span>Visible calls</span><strong>{integer.format(rows.length)}</strong></div>
         <div><span>Conversations</span><strong>{integer.format(visibleConversations)}</strong></div>
+        <div title={`${integer.format(totalTokens)} tokens`}><span>Total tokens</span><strong>{formatTokenTotal(totalTokens)}</strong></div>
         <div><span>Average cache hit</span><strong>{totalInput ? `${(totalCached / totalInput * 100).toFixed(1)}%` : "—"}</strong></div>
         <div><span>Last update</span><strong>{newest ? formatTime(newest.timestamp) : "—"}</strong></div>
       </section>
 
       <section className="table-card">
         <div className="table-scroll" ref={scrollRef}>
-          <table>
-            <thead><tr><th><DateFilter from={dateFrom} to={dateTo} onFrom={changeDateFrom} onTo={changeDateTo} onClear={clearDates} /></th><th>Project</th><th>Conversation</th><th>Model</th><th className="numeric">Input</th><th className="numeric">Cached</th><th className="numeric">Output</th><th className="numeric">Cache hit</th></tr></thead>
+          <table style={{ width: `max(100%, ${tableWidth}px)` }}>
+            <colgroup>
+              {columnKeys.map((key) => <col key={key} style={{ width: columnWidths[key] }} />)}
+            </colgroup>
+            <thead><tr>
+              <ColumnHeader column="time" width={columnWidths.time} onResize={resizeColumn} onReset={resetColumn}><DateFilter from={dateFrom} to={dateTo} onFrom={changeDateFrom} onTo={changeDateTo} onClear={clearDates} /></ColumnHeader>
+              <ColumnHeader column="project" width={columnWidths.project} onResize={resizeColumn} onReset={resetColumn}>Project</ColumnHeader>
+              <ColumnHeader column="conversation" width={columnWidths.conversation} onResize={resizeColumn} onReset={resetColumn}>Conversation</ColumnHeader>
+              <ColumnHeader column="model" width={columnWidths.model} onResize={resizeColumn} onReset={resetColumn}>Model</ColumnHeader>
+              <ColumnHeader column="input" width={columnWidths.input} numeric onResize={resizeColumn} onReset={resetColumn}>Input</ColumnHeader>
+              <ColumnHeader column="cached" width={columnWidths.cached} numeric onResize={resizeColumn} onReset={resetColumn}>Cached</ColumnHeader>
+              <ColumnHeader column="output" width={columnWidths.output} numeric onResize={resizeColumn} onReset={resetColumn}>Output</ColumnHeader>
+              <ColumnHeader column="cache" width={columnWidths.cache} numeric onResize={resizeColumn} onReset={resetColumn}>Cache hit</ColumnHeader>
+            </tr></thead>
             <tbody>
               {rows.map((call) => <CallRow key={call.id} call={call} conversation={conversationById.get(call.conversationId)} onConversation={chooseConversation} onProject={chooseProject} onConversationMenu={openConversationMenu} />)}
             </tbody>
@@ -219,13 +287,86 @@ export default function App() {
   );
 }
 
+function ColumnHeader({ column, width, numeric = false, children, onResize, onReset }: { column: ColumnKey; width: number; numeric?: boolean; children: React.ReactNode; onResize: (key: ColumnKey, width: number, save: boolean) => void; onReset: (key: ColumnKey) => void }) {
+  const config = COLUMN_CONFIG[column];
+  const beginResize = (event: React.PointerEvent<HTMLSpanElement>) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const target = event.currentTarget;
+    const pointerId = event.pointerId;
+    const startX = event.clientX;
+    const startWidth = width;
+    let latestWidth = width;
+    document.body.classList.add("column-resizing");
+    target.setPointerCapture(pointerId);
+    const move = (moveEvent: PointerEvent) => {
+      latestWidth = clampColumnWidth(column, startWidth + moveEvent.clientX - startX);
+      onResize(column, latestWidth, false);
+    };
+    const finish = () => {
+      if (target.hasPointerCapture(pointerId)) target.releasePointerCapture(pointerId);
+      target.removeEventListener("pointermove", move);
+      target.removeEventListener("pointerup", finish);
+      target.removeEventListener("pointercancel", finish);
+      document.body.classList.remove("column-resizing");
+      onResize(column, latestWidth, true);
+    };
+    target.addEventListener("pointermove", move);
+    target.addEventListener("pointerup", finish);
+    target.addEventListener("pointercancel", finish);
+  };
+  const changeWithKeyboard = (event: React.KeyboardEvent<HTMLSpanElement>) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    const step = event.shiftKey ? 25 : 10;
+    onResize(column, width + (event.key === "ArrowRight" ? step : -step), true);
+  };
+  return (
+    <th className={`resizable-header${numeric ? " numeric" : ""}`}>
+      {children}
+      <span
+        className="column-resizer"
+        role="separator"
+        aria-label={`调整 ${column} 列宽`}
+        aria-orientation="vertical"
+        aria-valuemin={config.minWidth}
+        aria-valuemax={MAX_COLUMN_WIDTH}
+        aria-valuenow={width}
+        tabIndex={0}
+        title="拖动调整列宽；双击恢复默认宽度"
+        onPointerDown={beginResize}
+        onDoubleClick={() => onReset(column)}
+        onKeyDown={changeWithKeyboard}
+      />
+    </th>
+  );
+}
+
+function formatTokenTotal(value: number) {
+  if (value < 1_000) return integer.format(value);
+  const units: Array<[number, string]> = [[1_000_000_000, "B"], [1_000_000, "M"], [1_000, "K"]];
+  const [divisor, suffix] = units.find(([divisor]) => value >= divisor) ?? units[units.length - 1];
+  const scaled = value / divisor;
+  const digits = scaled >= 100 ? 0 : scaled >= 10 ? 1 : 2;
+  return `${scaled.toFixed(digits).replace(/\.0+$|(?<=\.[0-9])0+$/, "")}${suffix}`;
+}
+
+function formatEffort(value: string) {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "xhigh" || normalized === "extra_high" || normalized === "extra-high") return "Extra High";
+  return normalized.split(/[_-]+/).filter(Boolean).map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(" ") || value;
+}
+
 function CallRow({ call, conversation, onConversation, onProject, onConversationMenu }: { call: CallRecord; conversation?: Conversation; onConversation: (id: string) => void; onProject: (id: string) => void; onConversationMenu: (event: React.MouseEvent, id: string) => void }) {
   return (
     <tr>
       <td className="time-cell" title={call.timestamp}>{formatTime(call.timestamp)}</td>
       <td className="project-cell"><button className="plain-filter-button" type="button" onClick={() => conversation && onProject(conversation.projectId)}>{conversation?.projectName || "Unassigned"}</button></td>
       <td className="conversation-cell"><button className="conversation-button" type="button" onClick={() => onConversation(call.conversationId)} onContextMenu={(event) => onConversationMenu(event, call.conversationId)} title={`${call.conversationId} · 右键复制 ID`}><strong>{conversation?.title || "Untitled conversation"}</strong><small>{call.conversationId}</small></button></td>
-      <td className="model-cell" title={call.effort ? `Reasoning: ${call.effort}` : undefined}>{call.model || "unknown"}</td>
+      <td className="model-cell" title={call.effort ? `Reasoning effort: ${formatEffort(call.effort)}` : undefined}>
+        <div className="model-stack"><strong>{call.model || "unknown"}</strong>{call.effort && <small>{formatEffort(call.effort)}</small>}</div>
+      </td>
       <td className="numeric token-input">{integer.format(call.usage.inputTokens)}</td>
       <td className="numeric token-cached">{integer.format(call.usage.cachedInputTokens)}</td>
       <td className="numeric token-output">{integer.format(call.usage.outputTokens)}</td>
