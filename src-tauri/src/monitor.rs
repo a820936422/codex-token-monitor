@@ -1,3 +1,4 @@
+use crate::model_audit::{AuditStore, ModelAudit, ModelAuditStatus};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -33,6 +34,8 @@ pub struct CallRecord {
     pub turn_id: Option<String>,
     pub response_id: Option<String>,
     pub model: String,
+    #[serde(default)]
+    pub model_audit: Option<ModelAudit>,
     pub effort: Option<String>,
     pub service_tier: String,
     pub usage: Usage,
@@ -79,6 +82,8 @@ pub struct MonitorStatus {
     pub session_roots: Vec<String>,
     pub session_index: String,
     pub last_scan_at: Option<String>,
+    #[serde(default)]
+    pub model_audit: ModelAuditStatus,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -145,6 +150,7 @@ struct Inner {
     calls: Vec<CallRecord>,
     seen_ids: HashSet<String>,
     files: HashMap<PathBuf, FileState>,
+    audit: AuditStore,
     conversation_meta: HashMap<String, ConversationMeta>,
     titles: HashMap<String, TitleEntry>,
     index_fingerprint: Option<(u64, Option<SystemTime>)>,
@@ -159,6 +165,7 @@ struct Inner {
 pub struct Monitor {
     roots: Vec<PathBuf>,
     index_path: PathBuf,
+    audit_directory: PathBuf,
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -192,6 +199,9 @@ impl Monitor {
         Self {
             roots,
             index_path,
+            audit_directory: env::var_os("CODEX_MODEL_AUDIT_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| codex_home.join("model-audit")),
             inner: Arc::new(Mutex::new(Inner::default())),
         }
     }
@@ -208,6 +218,8 @@ impl Monitor {
         for file in files {
             sync_file(&file, &mut inner, &mut new_calls);
         }
+        inner.audit.scan(&self.audit_directory);
+        enrich_calls(&mut inner, &mut new_calls);
         hydrate_projects(&mut inner);
         let next_catalog = build_catalog(&inner);
         let signature = serde_json::to_string(&next_catalog).unwrap_or_default();
@@ -219,7 +231,7 @@ impl Monitor {
             None
         };
         inner.last_scan_at = Some(Utc::now().to_rfc3339());
-        let status = make_status(&inner, &self.roots, &self.index_path);
+        let status = make_status(&inner, &self.roots, &self.index_path, &self.audit_directory);
         ScanResult {
             new_calls,
             catalog,
@@ -234,12 +246,42 @@ impl Monitor {
         Snapshot {
             calls,
             catalog: inner.catalog.clone(),
-            status: make_status(&inner, &self.roots, &self.index_path),
+            status: make_status(&inner, &self.roots, &self.index_path, &self.audit_directory),
         }
     }
 }
 
-fn make_status(inner: &Inner, roots: &[PathBuf], index: &Path) -> MonitorStatus {
+// A monitor-call event is an upsert. Audit-only changes must never insert usage again.
+fn enrich_calls(inner: &mut Inner, new_calls: &mut Vec<CallRecord>) {
+    let mut emitted: HashMap<String, usize> = new_calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| (call.id.clone(), index))
+        .collect();
+    for call in &mut inner.calls {
+        let Some(audit) = inner.audit.lookup(call.response_id.as_deref(), &call.model) else {
+            // Keep already-associated evidence when its cache entry is evicted.
+            continue;
+        };
+        if call.model_audit.as_ref() == Some(&audit) {
+            continue;
+        }
+        call.model_audit = Some(audit);
+        if let Some(&index) = emitted.get(&call.id) {
+            new_calls[index] = call.clone();
+        } else {
+            emitted.insert(call.id.clone(), new_calls.len());
+            new_calls.push(call.clone());
+        }
+    }
+}
+
+fn make_status(
+    inner: &Inner,
+    roots: &[PathBuf],
+    index: &Path,
+    audit_directory: &Path,
+) -> MonitorStatus {
     MonitorStatus {
         records: inner.calls.len(),
         conversations: inner.catalog.conversations.len(),
@@ -250,6 +292,14 @@ fn make_status(inner: &Inner, roots: &[PathBuf], index: &Path) -> MonitorStatus 
         session_roots: roots.iter().map(|p| p.display().to_string()).collect(),
         session_index: index.display().to_string(),
         last_scan_at: inner.last_scan_at.clone(),
+        model_audit: inner.audit.status(
+            audit_directory,
+            inner
+                .calls
+                .iter()
+                .filter(|call| call.model_audit.is_some())
+                .count(),
+        ),
     }
 }
 
@@ -468,6 +518,7 @@ fn process_row(row: &Value, state: &mut ParserState) -> Option<CallRecord> {
         turn_id,
         response_id,
         model,
+        model_audit: None,
         effort,
         service_tier,
         usage,
@@ -666,5 +717,176 @@ mod tests {
             &serde_json::json!({"input_tokens":42,"cached_input_tokens":40,"output_tokens":8}),
         );
         assert_eq!(usage.total_tokens, 50);
+    }
+
+    struct AuditFixture {
+        directory: PathBuf,
+        monitor: Monitor,
+    }
+
+    impl AuditFixture {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let directory = env::temp_dir().join(format!(
+                "model-audit-monitor-{}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ));
+            let sessions = directory.join("sessions");
+            let audit_directory = directory.join("audit");
+            fs::create_dir_all(&sessions).unwrap();
+            fs::create_dir_all(&audit_directory).unwrap();
+            let monitor = Monitor {
+                roots: vec![sessions],
+                index_path: directory.join("session_index.jsonl"),
+                audit_directory,
+                inner: Arc::new(Mutex::new(Inner::default())),
+            };
+            Self { directory, monitor }
+        }
+
+        fn write_call(&self) {
+            fs::write(self.monitor.roots[0].join("session.jsonl"), concat!(
+                "{\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"turn-1\",\"model\":\"model-1\"}}\n",
+                "{\"timestamp\":\"2026-09-14T01:00:00Z\",\"type\":\"token_usage_record\",\"payload\":{\"response_id\":\"resp-1\",\"turn_id\":\"turn-1\",\"usage\":{\"input_tokens\":40,\"output_tokens\":10}}}\n"
+            )).unwrap();
+        }
+
+        fn write_audit(&self, id: &str, name: &str) {
+            let row = serde_json::json!({
+                "schemaVersion":1, "observedAt":"2026-09-14T01:00:00Z",
+                "upstream":"https://provider.example", "transport":"http_json",
+                "responseId":id, "requestedModel":"wire-model", "reportedModel":"model-1",
+                "responseBodyModels":["model-1"], "completed":true,
+            });
+            fs::write(self.monitor.audit_directory.join(name), format!("{row}\n")).unwrap();
+        }
+    }
+
+    impl Drop for AuditFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[test]
+    fn late_audit_emits_upsert_without_duplicate_usage_and_persists_snapshot() {
+        let fixture = AuditFixture::new();
+        fixture.write_call();
+        let first = fixture.monitor.scan();
+        assert_eq!(first.new_calls.len(), 1);
+        assert!(first.new_calls[0].model_audit.is_none());
+        // Same turn/time/model cannot join a different response ID.
+        fixture.write_audit("turn-1", "capture-unrelated.jsonl");
+        assert!(fixture.monitor.scan().new_calls.is_empty());
+        fixture.write_audit("resp-1", "capture-exact.jsonl");
+        let updated = fixture.monitor.scan();
+        assert_eq!(updated.new_calls.len(), 1);
+        assert_eq!(updated.new_calls[0].id, first.new_calls[0].id);
+        assert_eq!(updated.new_calls[0].usage, first.new_calls[0].usage);
+        assert_eq!(
+            updated.new_calls[0].model_audit.as_ref().unwrap().status,
+            "match"
+        );
+        assert_eq!(updated.status.records, 1);
+        assert_eq!(updated.status.model_audit.matched_calls, 1);
+        assert_eq!(updated.status.model_audit.observations, 2);
+        let snapshot = fixture.monitor.snapshot();
+        assert_eq!(snapshot.calls.len(), 1);
+        assert_eq!(
+            snapshot
+                .calls
+                .iter()
+                .map(|call| call.usage.total_tokens)
+                .sum::<u64>(),
+            50
+        );
+        assert!(snapshot.calls[0].model_audit.is_some());
+        assert!(fixture.monitor.scan().new_calls.is_empty());
+    }
+
+    #[test]
+    fn audit_before_call_enriches_the_first_event() {
+        let fixture = AuditFixture::new();
+        fixture.write_audit("resp-1", "capture-first.jsonl");
+        assert!(fixture.monitor.scan().new_calls.is_empty());
+        fixture.write_call();
+        let scan = fixture.monitor.scan();
+        assert_eq!(scan.new_calls.len(), 1);
+        assert_eq!(
+            scan.new_calls[0].model_audit.as_ref().unwrap().status,
+            "match"
+        );
+        assert_eq!(scan.status.records, 1);
+        assert!(fixture.monitor.scan().new_calls.is_empty());
+    }
+
+    #[test]
+    fn audit_files_recover_after_partial_append_rotation_and_truncation() {
+        use std::io::Write;
+        let fixture = AuditFixture::new();
+        fixture.write_call();
+        let path = fixture.monitor.audit_directory.join("capture-live.jsonl");
+        fixture.write_audit("resp-1", "capture-live.jsonl");
+        let full = fs::read(&path).unwrap();
+        fs::write(&path, &full[..full.len() - 1]).unwrap();
+        assert!(fixture.monitor.scan().new_calls[0].model_audit.is_none());
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+        assert_eq!(
+            fixture.monitor.scan().new_calls[0]
+                .model_audit
+                .as_ref()
+                .unwrap()
+                .status,
+            "match"
+        );
+        fixture.write_audit("resp-2", "capture-rotated.jsonl");
+        assert_eq!(fixture.monitor.scan().status.model_audit.observations, 2);
+        fs::write(&path, b"bad-json\n").unwrap();
+        assert_eq!(fixture.monitor.scan().status.model_audit.parse_errors, 1);
+        fixture.write_audit("resp-3", "capture-replacement.jsonl");
+        fs::rename(
+            fixture
+                .monitor
+                .audit_directory
+                .join("capture-replacement.jsonl"),
+            &path,
+        )
+        .unwrap();
+        let final_scan = fixture.monitor.scan();
+        assert_eq!(final_scan.status.model_audit.observations, 3);
+        assert_eq!(final_scan.status.records, 1);
+        assert!(final_scan.new_calls.is_empty());
+    }
+
+    #[test]
+    fn old_call_and_status_json_default_audit_fields() {
+        let fixture = AuditFixture::new();
+        fixture.write_call();
+        let call = fixture.monitor.scan().new_calls.remove(0);
+        let mut value = serde_json::to_value(call).unwrap();
+        value.as_object_mut().unwrap().remove("modelAudit");
+        assert!(serde_json::from_value::<CallRecord>(value)
+            .unwrap()
+            .model_audit
+            .is_none());
+        let mut value = serde_json::to_value(MonitorStatus::default()).unwrap();
+        value.as_object_mut().unwrap().remove("modelAudit");
+        assert_eq!(
+            serde_json::from_value::<MonitorStatus>(value)
+                .unwrap()
+                .model_audit
+                .observations,
+            0
+        );
     }
 }

@@ -1,3 +1,4 @@
+mod model_audit;
 mod monitor;
 
 use monitor::{Monitor, Snapshot, POLL_MS};

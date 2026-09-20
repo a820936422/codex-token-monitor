@@ -4,6 +4,10 @@ src-tauri/target/
 src-tauri/gen/schemas/
 *.log
 *.tsbuildinfo
+__pycache__/
+*.pyc
+.model-probes/
+.model-audit/
 .DS_Store
 .env
 .env.*
