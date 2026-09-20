@@ -75,21 +75,27 @@ export function ModelAuditDetails({ call, onClose }: { call: CallRecord; onClose
 
 export function ModelAuditHelp({ metadata, onClose }: { metadata?: ModelAuditMonitor | null; onClose: () => void }) {
   return <AuditDialog title="模型采集说明" onClose={onClose}>
-    <p>现有 Codex JSONL 不包含响应模型字段，历史调用仍显示「未采集」。只有显式经过采集助手的流量才会记录响应模型，并通过精确 response_id 关联调用。</p>
+    <p>在工具栏下方的「响应模型采集」面板开启或暂停采集；「随程序启动自动采集」由后台保存，默认开启。面板显示采集状态和采集服务的实时内存、CPU 占用。</p>
+    <p>首次开启时，监控器会修改所选用户配置的 base URL，让请求经过本地转发服务，再发往原上游。请重启 Codex 以加载新地址；监控器无法自动重启 Codex。之后在 Codex 中发起正常请求即可采集，无需额外调用模型。</p>
+    <p>暂停会停止模型观测和记录写入，但继续转发，保障已打开的 Codex 会话连接。正常退出监控器时会恢复直连配置并关闭采集，一个小型进程会继续仅转发请求。</p>
+    <p>如需彻底停止转发，展开面板的「连接与退出设置」，先恢复直连配置，重启所有使用采集地址的 Codex 客户端，再点击「已重启 Codex，停止转发」。有进行中的请求时不能停止。</p>
+    <p>采集需读取经过本地服务的请求与响应中的模型声明；模型核对元数据保存在本地，请求仍发往原上游。现有 Codex JSONL 不包含响应模型字段，历史调用仍显示「未采集」；新采集记录通过精确 response_id 关联调用。</p>
     <p className="audit-note">{evidenceNote}</p>
     <dl className="audit-facts">
       <dt>采集元数据目录</dt><dd><code>{metadata?.directory || "监控端尚未提供"}</code></dd>
       <dt>已缓存响应 ID / 已关联调用 / 解析错误</dt><dd>{metadata?.observations ?? "—"} / {metadata?.matchedCalls ?? "—"} / {metadata?.parseErrors ?? "—"}</dd>
       <dt>最后观测时间</dt><dd>{metadata?.lastObservedAt ? <time dateTime={metadata.lastObservedAt}>{metadata.lastObservedAt}</time> : "暂无观测"}</dd>
     </dl>
-    <p className="audit-note">以上是已读取的采集元数据，不表示助手当前正在运行；顶部 Live 表示本地调用监控已连接。</p>
-    <p>在仓库根目录运行以下命令，随后在助手启动的 Codex 进程中发起正常请求：</p>
-    <h3>当前自定义提供方</h3>
-    <CopyValue value="python3 scripts/model_audit.py run --mode configured" label="自定义提供方采集命令" />
-    <h3>官方订阅</h3>
-    <CopyValue value="python3 scripts/model_audit.py run --mode official" label="官方订阅采集命令" />
-    <p>官方模式需要先完成 Codex 登录；命令仅为本次启动的进程覆盖提供方配置。</p>
-    <p>桌面端持久配置见仓库内 <code>docs/model-audit.md</code>。已运行的桌面应用不会自动接入助手，需要按文档配置并重新启动。</p>
-    <p className="audit-note">采集随普通请求进行，不会额外调用模型。这里的复制按钮只写入剪贴板，不执行命令。</p>
+    <p className="audit-note">以上是已读取的采集元数据；实时采集状态以采集面板为准。顶部 Live 仅表示本地调用监控已连接。</p>
+    <details className="collector-details">
+      <summary>可选：通过命令行单独启动采集</summary>
+      <p>若选择命令行方式，在仓库根目录运行以下命令，随后在助手启动的 Codex 进程中发起正常请求：</p>
+      <h3>当前自定义提供方</h3>
+      <CopyValue value="python3 scripts/model_audit.py run --mode configured" label="自定义提供方采集命令" />
+      <h3>官方订阅</h3>
+      <CopyValue value="python3 scripts/model_audit.py run --mode official" label="官方订阅采集命令" />
+      <p>官方模式需要先完成 Codex 登录；命令仅为本次启动的进程覆盖提供方配置。更多命令行说明见仓库内 <code>docs/model-audit.md</code>。</p>
+      <p className="audit-note">复制按钮只写入剪贴板，不执行命令。</p>
+    </details>
   </AuditDialog>;
 }

@@ -30,6 +30,37 @@ select:focus { border-color: color-mix(in srgb,var(--accent) 55%,var(--line)); b
 .ghost-button { min-height: 44px; padding: 0 13px; border: 1px solid var(--line); border-radius: 9px; color: var(--muted); background: transparent; cursor: pointer; }
 .ghost-button:hover { color: var(--text); border-color: #3a424b; background: var(--panel-2); }
 
+.collector-panel { margin-top: 12px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); font-size: 12px; }
+.collector-main { display: flex; align-items: center; flex-wrap: wrap; gap: 12px 24px; }
+.collector-heading { display: grid; gap: 5px; min-width: 160px; }
+.collector-heading h2 { margin: 0; font-size: 13px; font-weight: 700; }
+.collector-state { color: var(--muted); font-size: 11px; }
+.collector-on { color: var(--accent); }
+.collector-panel .collector-warning, .collector-error { color: var(--output); }
+.collector-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 20px; }
+.collector-switch { display: inline-flex; align-items: center; gap: 9px; min-height: 44px; padding: 0 4px; border: 0; border-radius: 6px; color: var(--text); background: transparent; cursor: pointer; }
+.collector-switch-track { display: inline-flex; align-items: center; width: 34px; height: 20px; padding: 3px; border: 1px solid var(--muted); border-radius: 999px; background: var(--panel-2); }
+.collector-switch-track > span { width: 12px; height: 12px; border-radius: 50%; background: var(--muted); }
+.collector-switch[aria-checked="true"] .collector-switch-track { border-color: var(--accent); background: var(--accent-soft); }
+.collector-switch[aria-checked="true"] .collector-switch-track > span { transform: translateX(14px); background: var(--accent); }
+.collector-auto { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; color: var(--muted); cursor: pointer; }
+.collector-auto input { width: 15px; height: 15px; margin: 0; accent-color: var(--accent); }
+.collector-metrics { display: flex; flex-wrap: wrap; gap: 12px 20px; margin: 0 0 0 auto; font-variant-numeric: tabular-nums; }
+.collector-metrics > div { display: grid; gap: 4px; }
+.collector-metrics dt { color: var(--muted); font-size: 10px; }
+.collector-metrics dd { margin: 0; white-space: nowrap; }
+.collector-note { margin: 8px 0 0; color: var(--muted); line-height: 1.65; overflow-wrap: anywhere; }
+.collector-details { margin-top: 10px; color: var(--muted); line-height: 1.65; }
+.collector-details > summary { width: fit-content; max-width: 100%; padding: 5px 0; color: var(--text); cursor: pointer; }
+.collector-details p { margin: 8px 0; overflow-wrap: anywhere; }
+.collector-details code { font-size: 11px; overflow-wrap: anywhere; user-select: text; }
+.collector-stop { margin-top: 10px; }
+.collector-error { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; margin-top: 8px; }
+.collector-error p { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+.collector-panel button:disabled, .collector-auto:has(input:disabled) { opacity: .55; cursor: default; }
+.collector-panel .ghost-button:hover:disabled { color: var(--muted); border-color: var(--line); background: transparent; }
+.collector-switch:focus-visible, .collector-auto input:focus-visible, .collector-details > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+
 .picker { position: relative; min-width: 0; }
 .picker > summary { display: flex; min-height: 44px; align-items: center; padding: 6px 36px 6px 12px; border: 1px solid var(--line); border-radius: 9px; outline: none; background: var(--bg); cursor: pointer; list-style: none; }
 .picker > summary::-webkit-details-marker { display: none; }
@@ -150,6 +181,9 @@ footer { display: flex; justify-content: space-between; gap: 16px; padding: 12px
 @media (max-width: 760px) {
   .shell { width: min(100% - 20px,1540px); padding-top: 18px; }
   .topbar { align-items: center; }
+  .collector-main { align-items: flex-start; gap: 8px 16px; }
+  .collector-controls { flex: 1 1 100%; gap: 4px 16px; }
+  .collector-metrics { margin-left: 0; gap: 12px 24px; }
   .toolbar { grid-template-columns: 1fr 1fr; }
   .project-field, .conversation-field { grid-column: 1 / -1; }
   .picker-menu, .picker-menu.wide { width: 100%; }

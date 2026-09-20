@@ -4,6 +4,7 @@ version = "0.3.0"
 description = "Local token monitor for ChatGPT Work and Codex"
 authors = ["Work Token Monitor contributors"]
 edition = "2021"
+rust-version = "1.89"
 license = "MIT"
 
 [lib]
@@ -19,3 +20,4 @@ serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
 chrono = { version = "=0.4.45", default-features = false, features = ["clock"] }
 tauri-plugin-clipboard-manager = "=2.3.3"
+toml_edit = "=0.25.15"

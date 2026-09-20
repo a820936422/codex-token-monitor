@@ -124,6 +124,8 @@ class ForwardingTests(unittest.TestCase):
         self.encoding = None
         self.model_headers = []
         self.received = []
+        self.response_started = threading.Event()
+        self.release_response = None
         case = self
 
         class Upstream(http.server.BaseHTTPRequestHandler):
@@ -145,6 +147,9 @@ class ForwardingTests(unittest.TestCase):
                     self.send_header("OpenAI-Model", value)
                 self.send_header("Content-Length", str(len(case.body)))
                 self.end_headers()
+                case.response_started.set()
+                if case.release_response is not None:
+                    case.release_response.wait(timeout=3)
                 self.wfile.write(case.body)
 
         self.upstream = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
@@ -173,6 +178,38 @@ class ForwardingTests(unittest.TestCase):
 
     def records(self):
         return [json.loads(line) for p in self.writer.directory.glob("*.jsonl") for line in p.read_text().splitlines()]
+
+    def test_connection_limit_rejects_without_forwarding_when_all_slots_busy(self):
+        for _ in range(16):
+            self.assertTrue(self.relay.slots.acquire(blocking=False))
+        try:
+            self.assertEqual(self.request()[0], 503)
+            self.assertEqual(self.received, [])
+        finally:
+            for _ in range(16):
+                self.relay.slots.release()
+
+    def test_pause_forwards_without_parsing_or_writing_and_resume_captures(self):
+        self.relay.set_capture(False)
+        with mock.patch('model_audit.ResponseObserver', side_effect=AssertionError('paused response parsed')):
+            self.assertEqual(self.request()[:2], (200, self.body))
+        self.assertEqual(self.records(), [])
+        self.relay.set_capture(True)
+        self.assertEqual(self.request()[0], 200)
+        self.assertEqual(len(self.records()), 1)
+
+    def test_pause_and_resume_excludes_response_already_in_flight(self):
+        self.release_response = threading.Event()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            response = executor.submit(self.request)
+            self.assertTrue(self.response_started.wait(timeout=2))
+            self.relay.set_capture(False)
+            self.relay.set_capture(True)
+            self.release_response.set()
+            self.assertEqual(response.result(timeout=3)[:2], (200, self.body))
+        self.assertEqual(self.records(), [])
+        self.request()
+        self.assertEqual(len(self.records()), 1)
 
     def test_forwards_original_bytes_and_client_oauth_without_persisting_secrets(self):
         status, body, headers = self.request()

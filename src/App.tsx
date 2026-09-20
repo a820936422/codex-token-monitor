@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { Picker, type PickerOption } from "./components/Picker";
 import { ModelAuditCell, ModelAuditDetails, ModelAuditHelp } from "./components/ModelAudit";
+import { CollectorControl } from "./components/CollectorControl";
 import { auditLabels, auditStatus, type AuditFilter } from "./modelAudit";
 import type { CallRecord, Catalog, Conversation, MonitorStatus, Snapshot } from "./types";
 
@@ -267,7 +268,7 @@ export default function App() {
     <main className="shell">
       <header className="topbar">
         <div>
-          <p className="eyebrow">TAURI · LOCAL · READ ONLY</p>
+          <p className="eyebrow">TAURI · LOCAL · TOKEN MONITOR</p>
           <h1>Work Token Monitor</h1>
           <p className="subtitle">实时查看 ChatGPT Work / Codex 每一次模型调用的 Input、Cached、Output 与缓存命中率。</p>
         </div>
@@ -283,6 +284,8 @@ export default function App() {
         <button className="ghost-button" type="button" onClick={clearAllFilters}>清除筛选</button>
         <button id="model-audit-help" className="ghost-button" type="button" aria-haspopup="dialog" onClick={() => setAuditDialog({ kind: "help" })}>模型采集说明</button>
       </section>
+
+      <CollectorControl />
 
       <section className="summary" aria-label="Summary">
         <div><span>Visible calls</span><strong>{integer.format(rows.length)}</strong></div>
@@ -319,7 +322,7 @@ export default function App() {
 
       <footer>
         <span>{status ? `Rust 监控 · ${status.files} files · ${status.pollMs} ms polling · ${status.parseErrors} errors` : "正在初始化 Rust 监控…"}</span>
-        <span>不读取对话正文 · 不读取 auth.json · 不上传数据</span>
+        <span>模型核对元数据保存在本地 · 正常请求仍发往原上游</span>
       </footer>
 
       {auditDialog?.kind === "help" && <ModelAuditHelp metadata={status?.modelAudit} onClose={() => setAuditDialog(null)} />}

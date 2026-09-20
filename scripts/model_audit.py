@@ -106,21 +106,42 @@ class AuditRelay(http.server.ThreadingHTTPServer):
         self.slots = threading.BoundedSemaphore(16)
         self.requests = 0
         self.forward_errors = 0
+        self.capture_lock = threading.Lock()
+        self.capture_enabled = True
+        self.capture_epoch = 0
+        self.active_requests = 0
         super().__init__(("127.0.0.1", port), AuditHandler)
 
-    def record(self, evidence: Evidence, transport: str, status: int | None) -> None:
+    def set_capture(self, enabled: bool) -> None:
+        # An acknowledged pause excludes even responses that were already streaming.
+        with self.capture_lock:
+            if enabled != self.capture_enabled:
+                self.capture_epoch += 1
+            self.capture_enabled = enabled
+
+    def capture_token(self) -> int | None:
+        with self.capture_lock:
+            return self.capture_epoch if self.capture_enabled else None
+
+    def record(self, evidence: Evidence, transport: str, status: int | None, token: int | None) -> None:
         record = evidence.report()
         record.update(schemaVersion=1, observedAt=dt.datetime.now(dt.timezone.utc).isoformat(),
                       upstream=self.origin, transport=transport, httpStatus=status)
-        self.writer.append(record)
+        with self.capture_lock:
+            if token is not None and self.capture_enabled and token == self.capture_epoch:
+                self.writer.append(record)
 
-    def record_failure(self, requested: object, issue: str, status: int | None = None) -> None:
+    def record_failure(self, requested: object, issue: str, token: int | None, status: int | None = None) -> None:
+        if token is None:
+            return
         evidence = Evidence(requested, {})
         evidence.issue(issue)
-        self.record(evidence, "http_json", status)
+        self.record(evidence, "http_json", status, token)
 
     def process_request(self, request, client_address):
-        if not self.slots.acquire(blocking=False):
+        # Give a just-finished connection time to release its slot before rejecting
+        # the next request from the same client. The active-connection cap stays 16.
+        if not self.slots.acquire(timeout=0.05):
             try:
                 cast(socket.socket, request).sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             finally:
@@ -134,8 +155,12 @@ class AuditRelay(http.server.ThreadingHTTPServer):
 
     def process_request_thread(self, request, client_address):
         try:
+            with self.capture_lock:
+                self.active_requests += 1
             super().process_request_thread(request, client_address)
         finally:
+            with self.capture_lock:
+                self.active_requests -= 1
             self.slots.release()
 
     def handle_error(self, request, client_address):
@@ -211,7 +236,8 @@ class AuditHandler(http.server.BaseHTTPRequestHandler):
             self.fail(415, "Disable features.enable_request_compression for HTTP model auditing")
             return
         requested = None
-        if route.path == "/v1/responses":
+        capture_token = self.relay.capture_token()
+        if route.path == "/v1/responses" and capture_token is not None:
             try:
                 payload = json.loads(body or b"")
                 if not isinstance(payload, dict):
@@ -236,14 +262,14 @@ class AuditHandler(http.server.BaseHTTPRequestHandler):
             if 300 <= exc.code < 400:
                 exc.close()
                 if route.path == "/v1/responses":
-                    self.relay.record_failure(requested, "upstream_redirect", exc.code)
+                    self.relay.record_failure(requested, "upstream_redirect", capture_token, exc.code)
                 self.fail(502, "Upstream redirects are not followed")
                 return
             upstream = exc
         except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException):
             self.relay.forward_errors += 1
             if route.path == "/v1/responses":
-                self.relay.record_failure(requested, "upstream_connection_failed")
+                self.relay.record_failure(requested, "upstream_connection_failed", capture_token)
             self.fail(502, "Upstream connection failed")
             return
         evidence = None
@@ -251,7 +277,7 @@ class AuditHandler(http.server.BaseHTTPRequestHandler):
         with upstream:
             content_type = upstream.headers.get("Content-Type", "application/json")
             status_code = cast(int, upstream.getcode())
-            if route.path == "/v1/responses":
+            if route.path == "/v1/responses" and capture_token is not None:
                 evidence = Evidence(requested, upstream.headers.items())
                 if not 200 <= status_code < 300:
                     evidence.issue("upstream_http_error")
@@ -270,6 +296,9 @@ class AuditHandler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
             try:
                 while chunk := upstream.read1(64 * 1024):
+                    if observer and capture_token != self.relay.capture_token():
+                        observer = None
+                        evidence = None
                     if observer:
                         observer.feed(chunk)
                     self.wfile.write(chunk)
@@ -281,7 +310,7 @@ class AuditHandler(http.server.BaseHTTPRequestHandler):
             finally:
                 if observer and evidence:
                     observer.finish()
-                    self.relay.record(evidence, "http_sse" if observer.sse else "http_json", status_code)
+                    self.relay.record(evidence, "http_sse" if observer.sse else "http_json", status_code, capture_token)
 
 
 def selected_profile(config: dict, args: list[str]) -> str | None:
