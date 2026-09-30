@@ -3,9 +3,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { Picker, type PickerOption } from "./components/Picker";
-import { ModelAuditCell, ModelAuditDetails, ModelAuditHelp } from "./components/ModelAudit";
-import { CollectorControl } from "./components/CollectorControl";
-import { auditLabels, auditStatus, type AuditFilter } from "./modelAudit";
 import type { CallRecord, Catalog, Conversation, MonitorStatus, Snapshot } from "./types";
 
 const integer = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
@@ -20,7 +17,6 @@ const COLUMN_CONFIG = {
   project: { defaultWidth: 170, minWidth: 110 },
   conversation: { defaultWidth: 320, minWidth: 190 },
   model: { defaultWidth: 180, minWidth: 130 },
-  modelAudit: { defaultWidth: 220, minWidth: 150 },
   input: { defaultWidth: 100, minWidth: 80 },
   cached: { defaultWidth: 100, minWidth: 80 },
   output: { defaultWidth: 100, minWidth: 80 },
@@ -79,23 +75,40 @@ export default function App() {
   const [follow, setFollow] = useState(true);
   const [live, setLive] = useState(false);
   const [monitorError, setMonitorError] = useState(false);
-  const [auditFilter, setAuditFilter] = useState<AuditFilter>("all");
-  const [auditDialog, setAuditDialog] = useState<{ kind: "help" } | { kind: "call"; id: string } | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; conversationId: string } | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     let active = true;
+    let failed = false;
     const unlisten: Array<() => void> = [];
-    // Retain only the latest event per ID while the initial snapshot is in flight.
+    // Preserve live updates that arrive while the initial snapshot is in flight.
     let pendingCalls: Map<string, CallRecord> | null = new Map();
     let pendingCatalog: Catalog | null = null;
     let pendingStatus: MonitorStatus | null = null;
     let initializing = true;
+    const release = (off: () => void) => {
+      try { void Promise.resolve(off()).catch((error) => console.error("Failed to release monitor listener", error)); }
+      catch (error) { console.error("Failed to release monitor listener", error); }
+    };
+    const dispose = () => unlisten.splice(0).forEach(release);
+    const clearPending = () => {
+      pendingCalls = null;
+      pendingCatalog = null;
+      pendingStatus = null;
+      initializing = false;
+    };
+    async function subscribe<T>(event: string, receive: (payload: T) => void) {
+      const off = await listen<T>(event, ({ payload }) => {
+        if (active && !failed) receive(payload);
+      });
+      // A sibling registration may have failed, or StrictMode may have unmounted us.
+      if (!active || failed) release(off);
+      else unlisten.push(off);
+    }
     void (async () => {
-      const [callOff, catalogOff, statusOff] = await Promise.all([
-        listen<CallRecord>("monitor-call", ({ payload }) => {
-          if (!active) return;
+      await Promise.all([
+        subscribe<CallRecord>("monitor-call", (payload) => {
           pendingCalls?.set(payload.id, payload);
           setCalls((current) => {
             const next = new Map(current);
@@ -103,55 +116,48 @@ export default function App() {
             return next;
           });
         }),
-        listen<Catalog>("monitor-catalog", ({ payload }) => {
-          if (!active) return;
+        subscribe<Catalog>("monitor-catalog", (payload) => {
           if (initializing) pendingCatalog = payload;
           setCatalog(payload);
         }),
-        listen<MonitorStatus>("monitor-status", ({ payload }) => {
-          if (!active) return;
+        subscribe<MonitorStatus>("monitor-status", (payload) => {
           if (initializing) pendingStatus = payload;
           setStatus(payload);
         }),
       ]);
-      if (!active) { callOff(); catalogOff(); statusOff(); return; }
-      unlisten.push(callOff, catalogOff, statusOff);
+      if (!active || failed) return;
       const snapshot = await invoke<Snapshot>("get_snapshot");
-      if (!active) return;
+      if (!active || failed) return;
       const merged = new Map(snapshot.calls.map((call) => [call.id, call]));
       pendingCalls?.forEach((call, id) => merged.set(id, call));
       setCalls(merged);
       setCatalog(pendingCatalog ?? snapshot.catalog);
       setStatus(pendingStatus ?? snapshot.status);
-      pendingCalls = null;
-      pendingCatalog = null;
-      pendingStatus = null;
-      initializing = false;
+      clearPending();
       setMonitorError(false);
       setLive(true);
     })().catch((error) => {
-      console.error("Failed to initialize monitor", error);
-      pendingCalls = null;
-      pendingCatalog = null;
-      pendingStatus = null;
-      initializing = false;
+      failed = true;
+      dispose();
+      clearPending();
       if (!active) return;
+      console.error("Failed to initialize monitor", error);
       setMonitorError(true);
       setLive(false);
     });
     return () => {
       active = false;
-      pendingCalls = null;
-      pendingCatalog = null;
-      pendingStatus = null;
-      initializing = false;
-      unlisten.forEach((off) => off());
+      clearPending();
+      dispose();
     };
   }, []);
 
   useEffect(() => {
-    if (projectId && !catalog.projects.some((project) => project.id === projectId)) setProjectId("");
-  }, [catalog.projects, projectId]);
+    if (live && projectId && !catalog.projects.some((project) => project.id === projectId)) {
+      setProjectId("");
+      persist("wtm.project", "");
+    }
+  }, [catalog.projects, projectId, live]);
 
   useEffect(() => {
     const close = () => setContextMenu(null);
@@ -169,8 +175,11 @@ export default function App() {
   const conversationsForProject = useMemo(() => catalog.conversations.filter((conversation) => !projectId || conversation.projectId === projectId), [catalog.conversations, projectId]);
 
   useEffect(() => {
-    if (conversationId && !conversationsForProject.some((conversation) => conversation.id === conversationId)) setConversationId("");
-  }, [conversationId, conversationsForProject]);
+    if (live && conversationId && !conversationsForProject.some((conversation) => conversation.id === conversationId)) {
+      setConversationId("");
+      persist("wtm.conversation", "");
+    }
+  }, [conversationId, conversationsForProject, live]);
 
   const conversationById = useMemo(() => new Map(catalog.conversations.map((conversation) => [conversation.id, conversation])), [catalog.conversations]);
 
@@ -178,7 +187,6 @@ export default function App() {
     const fromMs = dateBoundary(dateFrom, false);
     const toMs = dateBoundary(dateTo, true);
     const result = [...calls.values()].filter((call) => {
-      if (auditFilter !== "all" && auditStatus(call) !== auditFilter) return false;
       if (conversationId && call.conversationId !== conversationId) return false;
       if (!conversationId && projectId && conversationById.get(call.conversationId)?.projectId !== projectId) return false;
       const timestamp = Date.parse(call.timestamp);
@@ -191,7 +199,7 @@ export default function App() {
       return sort === "asc" ? delta : -delta;
     });
     return result;
-  }, [calls, conversationId, conversationById, dateFrom, dateTo, projectId, sort, auditFilter]);
+  }, [calls, conversationId, conversationById, dateFrom, dateTo, projectId, sort]);
 
   useEffect(() => {
     if (!follow || calls.size === 0) return;
@@ -219,9 +227,7 @@ export default function App() {
   const changeDateFrom = (value: string) => { setDateFrom(value); persist("wtm.dateFrom", value); };
   const changeDateTo = (value: string) => { setDateTo(value); persist("wtm.dateTo", value); };
   const clearDates = () => { changeDateFrom(""); changeDateTo(""); };
-  const clearAllFilters = () => { chooseProject(""); clearDates(); setAuditFilter("all"); };
-  const openAudit = (id: string) => setAuditDialog({ kind: "call", id });
-  const auditedCall = auditDialog?.kind === "call" ? calls.get(auditDialog.id) : undefined;
+  const clearAllFilters = () => { chooseProject(""); clearDates(); };
   const resizeColumn = (key: ColumnKey, width: number, save: boolean) => {
     setColumnWidths((current) => {
       const next = { ...current, [key]: clampColumnWidth(key, width) };
@@ -268,7 +274,7 @@ export default function App() {
     <main className="shell">
       <header className="topbar">
         <div>
-          <p className="eyebrow">TAURI · LOCAL · TOKEN MONITOR</p>
+          <p className="eyebrow">TAURI · LOCAL · READ ONLY</p>
           <h1>Work Token Monitor</h1>
           <p className="subtitle">实时查看 ChatGPT Work / Codex 每一次模型调用的 Input、Cached、Output 与缓存命中率。</p>
         </div>
@@ -278,14 +284,11 @@ export default function App() {
       <section className="toolbar" aria-label="Filters">
         <Picker label="Project" selectedId={projectId} allLabel="All Projects" allSecondary={`${catalog.projects.length} 个项目`} options={projectOptions} onSelect={chooseProject} />
         <Picker label="Conversation" selectedId={conversationId} allLabel="All Conversations" allSecondary={`${conversationsForProject.length} 个会话`} options={conversationOptions} wide onSelect={chooseConversation} />
-        <label className="field compact-field"><span>Sort</span><select value={sort} onChange={(event) => setSort(event.target.value as "asc" | "desc")}><option value="desc">最新优先</option><option value="asc">最早优先</option></select></label>
-        <label className="field audit-filter"><span>模型核对</span><select value={auditFilter} onChange={(event) => setAuditFilter(event.target.value as AuditFilter)}><option value="all">全部核对状态</option>{Object.entries(auditLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+        <label className="field compact-field"><span>Sort</span><select aria-label="Sort" value={sort} onChange={(event) => setSort(event.target.value as "asc" | "desc")}><option value="desc">最新优先</option><option value="asc">最早优先</option></select></label>
         <label className="toggle-field"><input type="checkbox" checked={follow} onChange={(event) => setFollow(event.target.checked)} /><span>Follow latest</span></label>
         <button className="ghost-button" type="button" onClick={clearAllFilters}>清除筛选</button>
-        <button id="model-audit-help" className="ghost-button" type="button" aria-haspopup="dialog" onClick={() => setAuditDialog({ kind: "help" })}>模型采集说明</button>
       </section>
 
-      <CollectorControl />
 
       <section className="summary" aria-label="Summary">
         <div><span>Visible calls</span><strong>{integer.format(rows.length)}</strong></div>
@@ -305,28 +308,25 @@ export default function App() {
               <ColumnHeader column="time" width={columnWidths.time} onResize={resizeColumn} onReset={resetColumn}><DateFilter from={dateFrom} to={dateTo} onFrom={changeDateFrom} onTo={changeDateTo} onClear={clearDates} /></ColumnHeader>
               <ColumnHeader column="project" width={columnWidths.project} onResize={resizeColumn} onReset={resetColumn}>Project</ColumnHeader>
               <ColumnHeader column="conversation" width={columnWidths.conversation} onResize={resizeColumn} onReset={resetColumn}>Conversation</ColumnHeader>
-              <ColumnHeader column="model" width={columnWidths.model} onResize={resizeColumn} onReset={resetColumn}>请求模型</ColumnHeader>
-              <ColumnHeader column="modelAudit" width={columnWidths.modelAudit} onResize={resizeColumn} onReset={resetColumn}>模型核对</ColumnHeader>
+              <ColumnHeader column="model" width={columnWidths.model} onResize={resizeColumn} onReset={resetColumn}><span title="Codex 日志记录的模型名称，不代表独立验证过的后端模型身份">日志模型</span></ColumnHeader>
               <ColumnHeader column="input" width={columnWidths.input} numeric onResize={resizeColumn} onReset={resetColumn}>Input</ColumnHeader>
               <ColumnHeader column="cached" width={columnWidths.cached} numeric onResize={resizeColumn} onReset={resetColumn}>Cached</ColumnHeader>
               <ColumnHeader column="output" width={columnWidths.output} numeric onResize={resizeColumn} onReset={resetColumn}>Output</ColumnHeader>
               <ColumnHeader column="cache" width={columnWidths.cache} numeric onResize={resizeColumn} onReset={resetColumn}>Cache hit</ColumnHeader>
             </tr></thead>
             <tbody>
-              {rows.map((call) => <CallRow key={call.id} call={call} conversation={conversationById.get(call.conversationId)} onConversation={chooseConversation} onProject={chooseProject} onConversationMenu={openConversationMenu} onAudit={openAudit} />)}
+              {rows.map((call) => <CallRow key={call.id} call={call} conversation={conversationById.get(call.conversationId)} onConversation={chooseConversation} onProject={chooseProject} onConversationMenu={openConversationMenu} />)}
             </tbody>
           </table>
-          {rows.length === 0 && <div className="empty-state" role="status">{monitorError ? "监控初始化失败，当前筛选（含模型核对）下暂无可显示记录。请重启后重试。" : !live ? "正在加载调用与模型核对记录…" : auditFilter !== "all" ? `当前项目、会话及日期范围内没有「${auditLabels[auditFilter]}」调用。可清除筛选或查看模型采集说明。` : "当前筛选条件下还没有模型调用。"}</div>}
+          {rows.length === 0 && <div className="empty-state" role="status">{monitorError ? "监控初始化失败，请重启后重试。" : !live ? "正在加载本地调用记录…" : "当前筛选条件下还没有模型调用。"}</div>}
         </div>
       </section>
 
       <footer>
         <span>{status ? `Rust 监控 · ${status.files} files · ${status.pollMs} ms polling · ${status.parseErrors} errors` : "正在初始化 Rust 监控…"}</span>
-        <span>模型核对元数据保存在本地 · 正常请求仍发往原上游</span>
+        <span>仅读取本地日志 · 不读取 auth.json · 不修改 Codex 配置 · 不上传数据</span>
       </footer>
 
-      {auditDialog?.kind === "help" && <ModelAuditHelp metadata={status?.modelAudit} onClose={() => setAuditDialog(null)} />}
-      {auditedCall && <ModelAuditDetails call={auditedCall} onClose={() => setAuditDialog(null)} />}
       {contextMenu && (
         <div className="conversation-context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} onPointerDown={(event) => event.stopPropagation()} onContextMenu={(event) => event.preventDefault()}>
           <button type="button" onClick={() => void copyConversationId()}>复制会话 ID</button>
@@ -408,7 +408,7 @@ function formatEffort(value: string) {
   return normalized.split(/[_-]+/).filter(Boolean).map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(" ") || value;
 }
 
-function CallRow({ call, conversation, onConversation, onProject, onConversationMenu, onAudit }: { call: CallRecord; conversation?: Conversation; onConversation: (id: string) => void; onProject: (id: string) => void; onConversationMenu: (event: React.MouseEvent, id: string) => void; onAudit: (id: string) => void }) {
+function CallRow({ call, conversation, onConversation, onProject, onConversationMenu }: { call: CallRecord; conversation?: Conversation; onConversation: (id: string) => void; onProject: (id: string) => void; onConversationMenu: (event: React.MouseEvent, id: string) => void }) {
   return (
     <tr>
       <td className="time-cell" title={call.timestamp}>{formatTime(call.timestamp)}</td>
@@ -417,7 +417,6 @@ function CallRow({ call, conversation, onConversation, onProject, onConversation
       <td className="model-cell" title={call.effort ? `Reasoning effort: ${formatEffort(call.effort)}` : undefined}>
         <div className="model-stack"><strong>{call.model || "unknown"}</strong>{call.effort && <small>{formatEffort(call.effort)}</small>}</div>
       </td>
-      <td className="audit-cell"><ModelAuditCell call={call} onOpen={onAudit} /></td>
       <td className="numeric token-input">{integer.format(call.usage.inputTokens)}</td>
       <td className="numeric token-cached">{integer.format(call.usage.cachedInputTokens)}</td>
       <td className="numeric token-output">{integer.format(call.usage.outputTokens)}</td>

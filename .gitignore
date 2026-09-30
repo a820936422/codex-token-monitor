@@ -4,10 +4,6 @@ src-tauri/target/
 src-tauri/gen/schemas/
 *.log
 *.tsbuildinfo
-__pycache__/
-*.pyc
-.model-probes/
-.model-audit/
 .DS_Store
 .env
 .env.*
@@ -19,3 +15,11 @@ src-tauri/icons/*
 # Generated lockfiles are intentionally not versioned
 package-lock.json
 src-tauri/Cargo.lock
+
+# Keep legacy diagnostic data private after removing its runtime.
+.model-probes/
+.model-audit/
+
+# Browser test outputs may contain local display metadata.
+/test-results/
+/playwright-report/

@@ -4,6 +4,14 @@ All notable changes to Work Token Monitor will be documented here.
 
 ## Unreleased
 
+- Added synthetic Rust and browser regressions for token monitoring, filters, initialization, privacy boundaries, and file changes
+- Fixed startup preference loss, failed-initialization listener cleanup, same-size log replacement, and overflow-safe token totals
+
+- Removed model declaration auditing, automatic collection, relay/configuration management, and the standalone network probe
+- Returned the desktop app to read-only local token monitoring; model names are explicitly labeled as log metadata
+- Removed the Python runtime requirement and direct configuration-editing dependency
+- Preserved existing token summaries, filters, column resizing, and snapshot/event merging
+
 - Added persistent drag-resizable table columns with keyboard resizing and double-click reset
 - Added filtered total-token usage summary with K/M/B compact units
 - Added reasoning-effort display beneath each model name

@@ -7,28 +7,6 @@ export interface Usage {
   totalTokens: number;
 }
 
-export type ModelAuditStatus = "match" | "different" | "unknown" | "conflict";
-
-export interface ModelAudit {
-  status: ModelAuditStatus;
-  sentModel: string | null;
-  reportedModel: string | null;
-  observedModels: string[];
-  sources: string[];
-  upstream: string;
-  observedAt: string;
-  completed: boolean;
-  captureIssues: string[];
-}
-
-export interface ModelAuditMonitor {
-  directory: string;
-  observations: number;
-  matchedCalls: number;
-  parseErrors: number;
-  lastObservedAt: string | null;
-}
-
 export interface CallRecord {
   id: string;
   timestamp: string;
@@ -37,7 +15,6 @@ export interface CallRecord {
   turnId: string | null;
   responseId: string | null;
   model: string;
-  modelAudit?: ModelAudit | null;
   effort: string | null;
   serviceTier: string;
   usage: Usage;
@@ -76,7 +53,6 @@ export interface MonitorStatus {
   sessionRoots: string[];
   sessionIndex: string;
   lastScanAt: string | null;
-  modelAudit?: ModelAuditMonitor | null;
 }
 
 export interface Snapshot {
