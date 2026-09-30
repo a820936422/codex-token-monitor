@@ -1,6 +1,6 @@
 {
   "name": "work-token-monitor",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -11,7 +11,10 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "test": "tsc -p tsconfig.tests.json && playwright test",
-    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml"
+    "test:rust": "cargo test --locked --manifest-path src-tauri/Cargo.toml",
+    "test:native": "node tests/native/smoke.mjs",
+    "format": "prettier --write \"src/**/*.{ts,tsx,css}\" \"tests/**/*.{ts,mjs}\" \"*.{json,ts}\" \".github/workflows/*.yml\"",
+    "format:check": "prettier --check \"src/**/*.{ts,tsx,css}\" \"tests/**/*.{ts,mjs}\" \"*.{json,ts}\" \".github/workflows/*.yml\""
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",
@@ -26,11 +29,13 @@
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "@vitejs/plugin-react": "5.2.0",
+    "prettier": "3.9.9",
     "typescript": "5.9.3",
     "vite": "7.3.6"
   },
   "license": "MIT",
   "engines": {
     "node": "^20.19.0 || >=22.12.0"
-  }
+  },
+  "packageManager": "npm@12.1.0"
 }

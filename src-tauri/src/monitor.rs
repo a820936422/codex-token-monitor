@@ -1,680 +1,554 @@
+//! Read-only, bounded session indexing. No model requests or credential/config reads.
+mod catalogue;
+mod discovery;
+mod model;
+mod parser;
+mod reader;
+mod store;
+mod watch;
+
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
+use discovery::{Discovery, MAX_FILES};
+use model::{CallRecord, Catalog, Diagnostics, MonitorStatus};
+pub use model::{Snapshot, Update};
+use parser::{text, timestamp, Parser};
+use reader::Cursor;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
-use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, Instant};
+use store::Store;
+use watch::WatchService;
 
 pub const POLL_MS: u64 = 750;
 const MAX_RECORDS: usize = 50_000;
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct Usage {
-    pub input_tokens: u64,
-    pub cached_input_tokens: u64,
-    pub cache_write_input_tokens: u64,
-    pub output_tokens: u64,
-    pub reasoning_output_tokens: u64,
-    pub total_tokens: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CallRecord {
-    pub id: String,
-    pub timestamp: String,
-    pub conversation_id: String,
-    pub thread_id: String,
-    pub turn_id: Option<String>,
-    pub response_id: Option<String>,
-    pub model: String,
-    pub effort: Option<String>,
-    pub service_tier: String,
-    pub usage: Usage,
-    pub fresh_input_tokens: u64,
-    pub cache_hit_rate: f64,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct Conversation {
-    pub id: String,
-    pub title: String,
-    pub cwd: Option<String>,
-    pub project_id: String,
-    pub project_name: String,
-    pub project_path: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct Project {
-    pub id: String,
-    pub name: String,
-    pub path: Option<String>,
-    pub conversations: usize,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct Catalog {
-    pub projects: Vec<Project>,
-    pub conversations: Vec<Conversation>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MonitorStatus {
-    pub records: usize,
-    pub conversations: usize,
-    pub projects: usize,
-    pub files: usize,
-    pub parse_errors: usize,
-    pub poll_ms: u64,
-    pub session_roots: Vec<String>,
-    pub session_index: String,
-    pub last_scan_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Snapshot {
-    pub calls: Vec<CallRecord>,
-    pub catalog: Catalog,
-    pub status: MonitorStatus,
-}
-
-#[derive(Debug, Clone, Default)]
-struct TurnContext {
-    model: String,
-    effort: Option<String>,
-    service_tier: String,
-}
-
-#[derive(Debug, Clone)]
-struct ParserState {
-    thread_id: Option<String>,
-    session_id: Option<String>,
-    current_turn_id: Option<String>,
-    current_model: String,
-    current_effort: Option<String>,
-    current_service_tier: String,
-    turn_contexts: HashMap<String, TurnContext>,
-}
-
-impl Default for ParserState {
-    fn default() -> Self {
-        Self {
-            thread_id: None,
-            session_id: None,
-            current_turn_id: None,
-            current_model: "unknown".into(),
-            current_effort: None,
-            current_service_tier: "default".into(),
-            turn_contexts: HashMap::new(),
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct FileState {
-    offset: u64,
-    identity: Option<(u64, u64)>,
-    modified: Option<SystemTime>,
-    remainder: Vec<u8>,
-    parser: ParserState,
-}
-
-#[derive(Debug, Clone, Default)]
-struct ConversationMeta {
-    cwd: Option<String>,
-    cwd_timestamp: String,
-}
-
-#[derive(Debug, Clone, Default)]
-struct TitleEntry {
-    title: String,
-    updated_at: String,
-}
+const MAX_TITLES: usize = 50_000;
+const SCAN_BYTES: usize = 4 * 1024 * 1024;
+const FILE_BYTES: usize = 256 * 1024;
+const BUFFER_POOL: usize = 8 * 1024 * 1024;
+const FILE_CHECKS: usize = 128;
+const SCAN_TIME: Duration = Duration::from_millis(50);
 
 #[derive(Default)]
-struct Inner {
-    calls: Vec<CallRecord>,
-    seen_ids: HashSet<String>,
-    files: HashMap<PathBuf, FileState>,
-    conversation_meta: HashMap<String, ConversationMeta>,
-    titles: HashMap<String, TitleEntry>,
-    index_fingerprint: Option<(u64, Option<SystemTime>)>,
-    project_cache: HashMap<PathBuf, PathBuf>,
-    catalog: Catalog,
-    catalog_signature: String,
-    parse_errors: usize,
-    last_scan_at: Option<String>,
+struct FileState {
+    cursor: Cursor,
+    parser: Parser,
 }
-
 #[derive(Clone)]
 pub struct Monitor {
+    inner: Arc<Mutex<Engine>>,
+}
+struct Engine {
     roots: Vec<PathBuf>,
     index_path: PathBuf,
-    inner: Arc<Mutex<Inner>>,
+    store: Store,
+    files: HashMap<PathBuf, FileState>,
+    paths: Vec<PathBuf>,
+    next_file: usize,
+    priority: VecDeque<PathBuf>,
+    queued: HashSet<PathBuf>,
+    discovery: Discovery,
+    watcher: Option<WatchService>,
+    index_cursor: Cursor,
+    titles: HashMap<String, (i64, String)>,
+    title_limit_reached: bool,
+    catalog: Catalog,
+    catalog_dirty: bool,
+    project_cache: HashMap<PathBuf, PathBuf>,
+    diagnostics: Diagnostics,
+    buffered: usize,
+    revision: u64,
+    status: MonitorStatus,
 }
-
-#[derive(Default)]
-pub struct ScanResult {
-    pub new_calls: Vec<CallRecord>,
-    pub catalog: Option<Catalog>,
-    pub status: MonitorStatus,
-}
-
 impl Monitor {
     pub fn from_env() -> Self {
         let home = env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
-        let codex_home = env::var_os("CODEX_HOME")
+        let home = env::var_os("CODEX_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".codex"));
         let roots = env::var_os("CODEX_SESSION_ROOT")
-            .map(|value| env::split_paths(&value).collect::<Vec<_>>())
-            .filter(|items| !items.is_empty())
-            .unwrap_or_else(|| {
-                vec![
-                    codex_home.join("sessions"),
-                    codex_home.join("archived_sessions"),
-                ]
-            });
-        let index_path = env::var_os("CODEX_SESSION_INDEX")
+            .map(|value| env::split_paths(&value).take(32).collect::<Vec<_>>())
+            .filter(|roots| !roots.is_empty())
+            .unwrap_or_else(|| vec![home.join("sessions"), home.join("archived_sessions")]);
+        let index = env::var_os("CODEX_SESSION_INDEX")
             .map(PathBuf::from)
-            .unwrap_or_else(|| codex_home.join("session_index.jsonl"));
-        Self {
-            roots,
-            index_path,
-            inner: Arc::new(Mutex::new(Inner::default())),
-        }
+            .unwrap_or_else(|| home.join("session_index.jsonl"));
+        let limit = env::var("WTM_RECORD_LIMIT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| (100..=100_000).contains(n))
+            .unwrap_or(MAX_RECORDS);
+        Self::with_paths(roots, index, limit, true)
     }
-
-    pub fn scan(&self) -> ScanResult {
-        let mut inner = self.inner.lock().expect("monitor mutex poisoned");
-        sync_session_index(&self.index_path, &mut inner);
-        let files = self
-            .roots
-            .iter()
-            .flat_map(|root| list_jsonl(root))
+    fn with_paths(roots: Vec<PathBuf>, index_path: PathBuf, limit: usize, watch: bool) -> Self {
+        let roots = roots
+            .into_iter()
+            .map(|p| p.canonicalize().unwrap_or(p))
             .collect::<Vec<_>>();
-        let mut new_calls = Vec::new();
-        for file in files {
-            sync_file(&file, &mut inner, &mut new_calls);
-        }
-        hydrate_projects(&mut inner);
-        let next_catalog = build_catalog(&inner);
-        let signature = serde_json::to_string(&next_catalog).unwrap_or_default();
-        let catalog = if signature != inner.catalog_signature {
-            inner.catalog_signature = signature;
-            inner.catalog = next_catalog.clone();
-            Some(next_catalog)
-        } else {
-            None
+        let status = MonitorStatus {
+            retention_limit: limit,
+            poll_ms: POLL_MS,
+            session_roots: roots
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            session_index: index_path.to_string_lossy().into_owned(),
+            ..MonitorStatus::default()
         };
-        inner.last_scan_at = Some(Utc::now().to_rfc3339());
-        let status = make_status(&inner, &self.roots, &self.index_path);
-        ScanResult {
-            new_calls,
-            catalog,
-            status,
+        Self {
+            inner: Arc::new(Mutex::new(Engine {
+                roots,
+                index_path,
+                store: Store::new(limit),
+                files: HashMap::new(),
+                paths: Vec::new(),
+                next_file: 0,
+                priority: VecDeque::new(),
+                queued: HashSet::new(),
+                discovery: Discovery::default(),
+                watcher: watch.then(WatchService::new),
+                index_cursor: Cursor::default(),
+                titles: HashMap::new(),
+                title_limit_reached: false,
+                catalog: Catalog::default(),
+                catalog_dirty: false,
+                project_cache: HashMap::new(),
+                diagnostics: Diagnostics::default(),
+                buffered: 0,
+                revision: 0,
+                status,
+            })),
         }
     }
-
+    pub fn scan(&self) -> Update {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).scan()
+    }
     pub fn snapshot(&self) -> Snapshot {
-        let inner = self.inner.lock().expect("monitor mutex poisoned");
-        let mut calls = inner.calls.clone();
-        calls.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         Snapshot {
-            calls,
+            revision: inner.revision,
+            calls: inner.store.snapshot(),
             catalog: inner.catalog.clone(),
-            status: make_status(&inner, &self.roots, &self.index_path),
+            status: inner.status.clone(),
         }
     }
 }
-
-fn make_status(inner: &Inner, roots: &[PathBuf], index: &Path) -> MonitorStatus {
-    MonitorStatus {
-        records: inner.calls.len(),
-        conversations: inner.catalog.conversations.len(),
-        projects: inner.catalog.projects.len(),
-        files: inner.files.len(),
-        parse_errors: inner.parse_errors,
-        poll_ms: POLL_MS,
-        session_roots: roots.iter().map(|p| p.display().to_string()).collect(),
-        session_index: index.display().to_string(),
-        last_scan_at: inner.last_scan_at.clone(),
+impl Engine {
+    fn queue(&mut self, path: PathBuf) {
+        if self.queued.len() < 1024 && self.queued.insert(path.clone()) {
+            self.priority.push_back(path);
+        }
     }
-}
-
-fn list_jsonl(root: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(current) = stack.pop() {
-        let Ok(entries) = fs::read_dir(current) else {
-            continue;
+    fn add_path(&mut self, path: PathBuf) {
+        if !self.files.contains_key(&path) && self.files.len() < MAX_FILES {
+            self.files.insert(path.clone(), FileState::default());
+            self.paths.push(path.clone());
+            self.queue(path);
+        }
+    }
+    fn watch_events(&mut self) {
+        let Some(watcher) = self.watcher.as_mut() else {
+            return;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            if kind.is_dir() {
-                stack.push(path);
-            } else if kind.is_file() && path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
-                found.push(path);
+        watcher.refresh(&self.roots, &self.index_path);
+        let (events, overflow) = watcher.drain();
+        if overflow {
+            self.discovery.request();
+        }
+        for event in events {
+            if event.kind.is_create() || event.kind.is_remove() {
+                self.discovery.request();
             }
-        }
-    }
-    found
-}
-
-fn file_identity(meta: &fs::Metadata) -> Option<(u64, u64)> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Some((meta.dev(), meta.ino()))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = meta;
-        None
-    }
-}
-
-fn sync_file(path: &Path, inner: &mut Inner, new_calls: &mut Vec<CallRecord>) {
-    let Ok(path_meta) = fs::metadata(path) else {
-        return;
-    };
-    // Avoid opening unchanged files, but do not mistake a replacement for an append.
-    if inner.files.get(path).is_some_and(|state| {
-        state.offset == path_meta.len()
-            && state.identity == file_identity(&path_meta)
-            && state.modified == path_meta.modified().ok()
-    }) {
-        return;
-    }
-    let Ok(mut file) = File::open(path) else {
-        return;
-    };
-    // Inspect the actual opened file in case it was replaced after the path stat.
-    let Ok(meta) = file.metadata() else { return };
-    let size = meta.len();
-    let identity = file_identity(&meta);
-    let modified = meta.modified().ok();
-    let mut state = inner.files.remove(path).unwrap_or_default();
-    if identity != state.identity
-        || size < state.offset
-        || (size == state.offset && state.offset > 0 && modified != state.modified)
-    {
-        state = FileState::default();
-    }
-    if size > state.offset {
-        let mut bytes = Vec::new();
-        let remaining = size - state.offset;
-        // Read only the measured range; concurrent appends belong to the next scan.
-        if file.seek(SeekFrom::Start(state.offset)).is_ok()
-            && file.take(remaining).read_to_end(&mut bytes).is_ok()
-        {
-            state.offset += bytes.len() as u64;
-            consume_bytes(&mut state, bytes, inner, new_calls);
-        }
-    }
-    state.identity = identity;
-    state.modified = modified;
-    inner.files.insert(path.to_path_buf(), state);
-}
-
-fn consume_bytes(
-    state: &mut FileState,
-    bytes: Vec<u8>,
-    inner: &mut Inner,
-    new_calls: &mut Vec<CallRecord>,
-) {
-    state.remainder.extend(bytes);
-    let mut start = 0usize;
-    let mut lines = Vec::new();
-    for (i, byte) in state.remainder.iter().enumerate() {
-        if *byte == b'\n' {
-            lines.push(state.remainder[start..i].to_vec());
-            start = i + 1;
-        }
-    }
-    let tail = state.remainder[start..].to_vec();
-    state.remainder = tail;
-    for line in lines {
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        let Ok(row) = serde_json::from_slice::<Value>(&line) else {
-            inner.parse_errors += 1;
-            continue;
-        };
-        if let Some((conversation_id, cwd, timestamp)) = session_meta(&row) {
-            let entry = inner.conversation_meta.entry(conversation_id).or_default();
-            if cwd.is_some() && (entry.cwd.is_none() || timestamp >= entry.cwd_timestamp) {
-                entry.cwd = cwd;
-                entry.cwd_timestamp = timestamp;
-            }
-        }
-        if let Some(call) = process_row(&row, &mut state.parser) {
-            if inner.seen_ids.insert(call.id.clone()) {
-                inner.calls.push(call.clone());
-                new_calls.push(call);
-                if inner.calls.len() > MAX_RECORDS {
-                    let excess = inner.calls.len() - MAX_RECORDS;
-                    inner.calls.drain(0..excess);
+            for path in event.paths {
+                if path.extension().is_some_and(|e| e == "jsonl")
+                    && self.roots.iter().any(|root| path.starts_with(root))
+                    && path.is_file()
+                {
+                    if self.discovery.active && self.discovery.seen.len() < MAX_FILES {
+                        self.discovery.seen.insert(path.clone());
+                    }
+                    self.add_path(path.clone());
+                    self.queue(path);
                 }
             }
         }
     }
-}
-
-fn session_meta(row: &Value) -> Option<(String, Option<String>, String)> {
-    if row.get("type")?.as_str()? != "session_meta" {
-        return None;
-    }
-    let payload = row.get("payload")?;
-    let thread_id = string(payload, "id");
-    let conversation_id = string(payload, "session_id").or(thread_id)?;
-    let cwd = string(payload, "cwd");
-    let timestamp = string(payload, "timestamp")
-        .or_else(|| string(row, "timestamp"))
-        .unwrap_or_default();
-    Some((conversation_id, cwd, timestamp))
-}
-
-fn process_row(row: &Value, state: &mut ParserState) -> Option<CallRecord> {
-    let row_type = row.get("type").and_then(Value::as_str)?;
-    let payload = row.get("payload").unwrap_or(&Value::Null);
-    match row_type {
-        "session_meta" => {
-            state.thread_id = string(payload, "id").or(state.thread_id.clone());
-            state.session_id = string(payload, "session_id")
-                .or_else(|| string(payload, "id"))
-                .or(state.session_id.clone());
-            return None;
+    fn insert(
+        &mut self,
+        call: CallRecord,
+        changed: &mut HashMap<String, CallRecord>,
+        removed: &mut HashSet<String>,
+    ) {
+        let (added, evicted) = self.store.insert(call.clone());
+        if added {
+            self.catalog_dirty = true;
+            changed.insert(call.id.clone(), call);
+            if let Some(id) = evicted {
+                changed.remove(&id);
+                removed.insert(id);
+            }
         }
-        "turn_context" => {
-            state.current_turn_id = string(payload, "turn_id").or(state.current_turn_id.clone());
-            state.current_model =
-                string(payload, "model").unwrap_or_else(|| state.current_model.clone());
-            state.current_effort = string(payload, "effort").or(state.current_effort.clone());
-            state.current_service_tier = string(payload, "service_tier")
-                .unwrap_or_else(|| state.current_service_tier.clone());
-            if let Some(id) = state.current_turn_id.clone() {
-                state.turn_contexts.insert(
-                    id,
-                    TurnContext {
-                        model: state.current_model.clone(),
-                        effort: state.current_effort.clone(),
-                        service_tier: state.current_service_tier.clone(),
+    }
+
+    fn poll_file(
+        &mut self,
+        path: &PathBuf,
+        budget: usize,
+        deadline: Instant,
+        changed: &mut HashMap<String, CallRecord>,
+        removed: &mut HashSet<String>,
+    ) -> (usize, bool) {
+        let Some(mut state) = self.files.remove(path) else {
+            return (0, false);
+        };
+        self.buffered = self.buffered.saturating_sub(state.cursor.remainder.len());
+        let mut read = 0;
+        let mut success = true;
+        match state.cursor.open(path) {
+            Ok(Some(mut file)) => {
+                if state.cursor.reset {
+                    state.parser = Parser::default();
+                }
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                path.hash(&mut hasher);
+                let source = format!("file:{:x}", hasher.finish());
+                let mut diagnostics = std::mem::take(&mut self.diagnostics);
+                let mut oversized = 0;
+                let parser = &mut state.parser;
+                let before = state.cursor.offset;
+                let result = state.cursor.read(
+                    &mut file,
+                    budget,
+                    BUFFER_POOL.saturating_sub(self.buffered),
+                    deadline,
+                    |bytes, offset| {
+                        if bytes.iter().all(u8::is_ascii_whitespace) {
+                            return;
+                        }
+                        match serde_json::from_slice::<Value>(bytes) {
+                            Ok(row) => {
+                                if row.get("type").and_then(Value::as_str) == Some("session_meta") {
+                                    self.catalog_dirty = true;
+                                }
+                                if let Some(call) =
+                                    parser.consume(&row, offset, &source, &mut diagnostics)
+                                {
+                                    self.insert(call, changed, removed);
+                                }
+                            }
+                            Err(_) => diagnostics.parse_errors += 1,
+                        }
                     },
+                    &mut oversized,
                 );
+                read = state.cursor.offset.saturating_sub(before) as usize;
+                diagnostics.oversized_lines += oversized;
+                self.diagnostics = diagnostics;
+                if result.is_err() {
+                    state.cursor.unreadable = true;
+                    success = false;
+                }
             }
-            return None;
-        }
-        "event_msg" => {
-            match payload.get("type").and_then(Value::as_str) {
-                Some("task_started") => {
-                    state.current_turn_id =
-                        string(payload, "turn_id").or(state.current_turn_id.clone())
-                }
-                Some("thread_settings_applied") => {
-                    if let Some(tier) = payload
-                        .get("thread_settings")
-                        .and_then(|v| string(v, "service_tier"))
-                    {
-                        state.current_service_tier = tier;
-                    }
-                }
-                Some("task_complete") => {
-                    let id = string(payload, "turn_id");
-                    if id.is_none() || id == state.current_turn_id {
-                        state.current_turn_id = None;
-                    }
-                }
-                _ => {}
+            Ok(None) => {}
+            Err(_) => {
+                state.cursor.unreadable = true;
+                state.cursor.initialized = true;
+                success = false;
             }
-            return None;
         }
-        "token_usage_record" => {}
-        _ => return None,
-    }
-    let usage_raw = payload.get("usage")?;
-    let usage = normalize_usage(usage_raw);
-    let turn_id = string(payload, "turn_id").or(state.current_turn_id.clone());
-    let context = turn_id
-        .as_ref()
-        .and_then(|id| state.turn_contexts.get(id))
-        .cloned()
-        .unwrap_or_default();
-    let thread_id = string(payload, "thread_id")
-        .or(state.thread_id.clone())
-        .or_else(|| string(payload, "session_id"))
-        .or(state.session_id.clone())
-        .unwrap_or_else(|| "unknown".into());
-    let conversation_id = string(payload, "session_id")
-        .or(state.session_id.clone())
-        .unwrap_or_else(|| thread_id.clone());
-    let response_id = string(payload, "response_id");
-    let timestamp = string(row, "timestamp").unwrap_or_else(|| Utc::now().to_rfc3339());
-    let id = response_id.clone().unwrap_or_else(|| {
-        format!(
-            "{}:{}:{}:{}:{}",
-            thread_id,
-            turn_id.clone().unwrap_or_else(|| "no-turn".into()),
-            timestamp,
-            usage.input_tokens,
-            usage.output_tokens
-        )
-    });
-    let model = if context.model.is_empty() {
-        state.current_model.clone()
-    } else {
-        context.model
-    };
-    let effort = context.effort.or(state.current_effort.clone());
-    let service_tier = if context.service_tier.is_empty() {
-        state.current_service_tier.clone()
-    } else {
-        context.service_tier
-    };
-    let fresh_input_tokens = usage
-        .input_tokens
-        .saturating_sub(usage.cached_input_tokens)
-        .saturating_sub(usage.cache_write_input_tokens);
-    let cache_hit_rate = if usage.input_tokens > 0 {
-        usage.cached_input_tokens as f64 / usage.input_tokens as f64 * 100.0
-    } else {
-        0.0
-    };
-    Some(CallRecord {
-        id,
-        timestamp,
-        conversation_id,
-        thread_id,
-        turn_id,
-        response_id,
-        model,
-        effort,
-        service_tier,
-        usage,
-        fresh_input_tokens,
-        cache_hit_rate,
-    })
-}
-
-fn normalize_usage(raw: &Value) -> Usage {
-    let input_tokens = u64v(raw, "input_tokens");
-    let cached_input_tokens = u64v(raw, "cached_input_tokens");
-    let cache_write_input_tokens = u64v(raw, "cache_write_input_tokens");
-    let output_tokens = u64v(raw, "output_tokens");
-    let reasoning_output_tokens = u64v(raw, "reasoning_output_tokens");
-    let total_tokens = match u64v(raw, "total_tokens") {
-        0 => input_tokens.saturating_add(output_tokens),
-        value => value,
-    };
-    Usage {
-        input_tokens,
-        cached_input_tokens,
-        cache_write_input_tokens,
-        output_tokens,
-        reasoning_output_tokens,
-        total_tokens,
-    }
-}
-
-fn sync_session_index(path: &Path, inner: &mut Inner) {
-    let Ok(meta) = fs::metadata(path) else { return };
-    let fingerprint = (meta.len(), meta.modified().ok());
-    if inner.index_fingerprint == Some(fingerprint) {
-        return;
-    }
-    let Ok(text) = fs::read_to_string(path) else {
-        return;
-    };
-    let mut latest: HashMap<String, TitleEntry> = HashMap::new();
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(row) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let Some(id) = string(&row, "id") else {
-            continue;
-        };
-        let updated_at = string(&row, "updated_at").unwrap_or_default();
-        let title = string(&row, "thread_name")
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "Untitled conversation".into());
-        let replace = latest
-            .get(&id)
-            .map(|old| updated_at >= old.updated_at)
-            .unwrap_or(true);
-        if replace {
-            latest.insert(id, TitleEntry { title, updated_at });
+        state.cursor.remainder.shrink_to_fit();
+        self.buffered += state.cursor.remainder.len();
+        let pending = !state.cursor.unreadable && state.cursor.offset < state.cursor.size;
+        self.files.insert(path.clone(), state);
+        if pending {
+            self.queue(path.clone());
         }
+        (read, success)
     }
-    inner.titles = latest;
-    inner.index_fingerprint = Some(fingerprint);
-}
-
-fn hydrate_projects(inner: &mut Inner) {
-    let paths = inner
-        .conversation_meta
-        .values()
-        .filter_map(|m| m.cwd.clone())
-        .collect::<HashSet<_>>();
-    for cwd in paths {
-        let path = PathBuf::from(&cwd);
-        if inner.project_cache.contains_key(&path) {
-            continue;
+    fn poll_index(&mut self, budget: usize, deadline: Instant) -> (usize, bool) {
+        self.buffered = self
+            .buffered
+            .saturating_sub(self.index_cursor.remainder.len());
+        let opened = self.index_cursor.open(&self.index_path);
+        let mut read = 0;
+        let mut success = true;
+        match opened {
+            Ok(Some(mut file)) => {
+                if self.index_cursor.reset {
+                    self.titles.clear();
+                    self.title_limit_reached = false;
+                    self.catalog_dirty = true;
+                }
+                let titles = &mut self.titles;
+                let dirty = &mut self.catalog_dirty;
+                let limited = &mut self.title_limit_reached;
+                let diagnostics = &mut self.diagnostics;
+                let mut oversized = 0;
+                let before = self.index_cursor.offset;
+                let result = self.index_cursor.read(
+                    &mut file,
+                    budget,
+                    BUFFER_POOL.saturating_sub(self.buffered),
+                    deadline,
+                    |bytes, _| {
+                        if bytes.iter().all(u8::is_ascii_whitespace) {
+                            return;
+                        }
+                        let Ok(row) = serde_json::from_slice::<Value>(bytes) else {
+                            diagnostics.parse_errors += 1;
+                            return;
+                        };
+                        let Some(id) = text(&row, "id", 256) else {
+                            diagnostics.invalid_records += 1;
+                            return;
+                        };
+                        let title = text(&row, "thread_name", 1024)
+                            .unwrap_or_else(|| "Untitled conversation".into());
+                        let updated = row
+                            .get("updated_at")
+                            .and_then(Value::as_str)
+                            .and_then(timestamp)
+                            .map(|(_, ms)| ms)
+                            .unwrap_or(i64::MIN);
+                        if !titles.contains_key(&id) && titles.len() >= MAX_TITLES {
+                            *limited = true;
+                            return;
+                        }
+                        if titles
+                            .get(&id)
+                            .is_none_or(|old| (updated, &title) > (old.0, &old.1))
+                        {
+                            titles.insert(id, (updated, title));
+                            *dirty = true;
+                        }
+                    },
+                    &mut oversized,
+                );
+                diagnostics.oversized_lines += oversized;
+                read = self.index_cursor.offset.saturating_sub(before) as usize;
+                if result.is_err() {
+                    self.index_cursor.unreadable = true;
+                    success = false;
+                }
+            }
+            Ok(None) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !self.titles.is_empty() {
+                    self.catalog_dirty = true;
+                    self.titles.clear();
+                }
+                self.index_cursor = Cursor::default();
+                self.index_cursor.initialized = true;
+                success = false;
+            }
+            Err(_) => {
+                self.index_cursor.unreadable = true;
+                self.index_cursor.initialized = true;
+                success = false;
+            }
         }
-        let mut current = path.clone();
-        let mut project = path.clone();
-        loop {
-            if current.join(".git").exists() {
-                project = current.clone();
+        self.index_cursor.remainder.shrink_to_fit();
+        self.buffered += self.index_cursor.remainder.len();
+        (read, success)
+    }
+    fn scan(&mut self) -> Update {
+        let started = Instant::now();
+        self.watch_events();
+        let (added, discovered) = self.discovery.step(&self.roots);
+        for path in added {
+            self.add_path(path);
+        }
+        if discovered {
+            if !self.discovery.limited && self.discovery.errors == 0 {
+                self.files
+                    .retain(|path, _| self.discovery.seen.contains(path));
+                self.paths.retain(|path| self.files.contains_key(path));
+                self.priority.retain(|path| self.files.contains_key(path));
+                self.queued.retain(|path| self.files.contains_key(path));
+                self.buffered = self
+                    .files
+                    .values()
+                    .map(|f| f.cursor.remainder.len())
+                    .sum::<usize>()
+                    + self.index_cursor.remainder.len();
+            }
+            self.project_cache.clear();
+            self.catalog_dirty = true;
+        }
+        let mut changed = HashMap::new();
+        let mut removed = HashSet::new();
+        let (mut read_bytes, mut any_success) = self.poll_index(FILE_BYTES, started + SCAN_TIME);
+        let mut checked = HashSet::new();
+        for step in 0..FILE_CHECKS {
+            if read_bytes >= SCAN_BYTES || started.elapsed() >= SCAN_TIME {
                 break;
             }
-            let Some(parent) = current.parent() else {
-                break;
+            let preferred = if step % 2 == 0 {
+                self.priority.pop_front()
+            } else {
+                None
             };
-            if parent == current {
-                break;
+            let path = match preferred {
+                Some(path) => {
+                    self.queued.remove(&path);
+                    path
+                }
+                None if !self.paths.is_empty() => {
+                    self.next_file %= self.paths.len();
+                    let path = self.paths[self.next_file].clone();
+                    self.next_file += 1;
+                    path
+                }
+                None => break,
+            };
+            if !checked.insert(path.clone()) {
+                continue;
             }
-            current = parent.to_path_buf();
+            let allowance = (SCAN_BYTES / self.paths.len().max(1)).max(FILE_BYTES);
+            let (bytes, ok) = self.poll_file(
+                &path,
+                allowance.min(SCAN_BYTES - read_bytes),
+                started + SCAN_TIME,
+                &mut changed,
+                &mut removed,
+            );
+            read_bytes += bytes;
+            any_success |= ok;
         }
-        inner.project_cache.insert(path, project);
-    }
-}
-
-fn build_catalog(inner: &Inner) -> Catalog {
-    let mut ids = inner
-        .conversation_meta
-        .keys()
-        .cloned()
-        .collect::<HashSet<_>>();
-    ids.extend(inner.calls.iter().map(|call| call.conversation_id.clone()));
-    let mut conversations = Vec::new();
-    for id in ids.into_iter().filter(|id| id != "unknown") {
-        let meta = inner.conversation_meta.get(&id);
-        let cwd = meta.and_then(|m| m.cwd.clone());
-        let project_path = cwd.as_ref().map(|cwd| {
-            inner
-                .project_cache
-                .get(&PathBuf::from(cwd))
-                .cloned()
-                .unwrap_or_else(|| PathBuf::from(cwd))
-        });
-        let (project_id, project_name, project_path_string) = if let Some(path) = project_path {
-            let text = path.display().to_string();
-            let name = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or(&text)
-                .to_string();
-            (text.clone(), name, Some(text))
-        } else {
-            ("__unassigned__".into(), "Other / Unassigned".into(), None)
+        let mut catalog = None;
+        if self.catalog_dirty {
+            let mut root_cwds = HashMap::new();
+            for call in self.store.calls.values().rev() {
+                if call.thread_id == call.conversation_id {
+                    if let Some(cwd) = &call.cwd {
+                        root_cwds
+                            .entry(call.conversation_id.clone())
+                            .or_insert_with(|| cwd.clone());
+                    }
+                }
+            }
+            let mut fallback: Vec<_> = self.files.iter().collect();
+            fallback.sort_unstable_by_key(|(path, _)| *path);
+            for (_, file) in fallback {
+                if file.parser.thread_id == file.parser.session_id {
+                    if let (Some(id), Some(cwd)) = (&file.parser.session_id, &file.parser.cwd) {
+                        root_cwds.entry(id.clone()).or_insert_with(|| cwd.clone());
+                    }
+                }
+            }
+            let next = catalogue::build(
+                &self.store,
+                &self.titles,
+                &root_cwds,
+                &mut self.project_cache,
+            );
+            if next != self.catalog {
+                self.catalog = next;
+                catalog = Some(self.catalog.clone());
+            }
+            self.catalog_dirty = false;
+        }
+        self.revision += 1;
+        let cursors: Vec<_> = self
+            .files
+            .values()
+            .map(|f| &f.cursor)
+            .chain(std::iter::once(&self.index_cursor))
+            .collect();
+        let pending_files = cursors
+            .iter()
+            .filter(|c| !c.unreadable && (!c.initialized || c.offset < c.size))
+            .count();
+        let now = Utc::now().to_rfc3339();
+        let success = any_success
+            || (discovered
+                && self.discovery.errors == 0
+                && self.discovery.missing_roots < self.roots.len());
+        self.status = MonitorStatus {
+            revision: self.revision,
+            records: self.store.calls.len(),
+            retention_limit: self.store.limit,
+            truncated: self.store.truncated,
+            oldest_at: self
+                .store
+                .calls
+                .first_key_value()
+                .map(|(_, c)| c.timestamp.clone()),
+            newest_at: self
+                .store
+                .calls
+                .last_key_value()
+                .map(|(_, c)| c.timestamp.clone()),
+            conversations: self.catalog.conversations.len(),
+            projects: self.catalog.projects.len(),
+            files: self.files.len(),
+            indexed_files: self.files.values().filter(|f| f.cursor.initialized).count(),
+            pending_files,
+            pending_bytes: cursors
+                .iter()
+                .map(|c| c.size.saturating_sub(c.offset))
+                .sum(),
+            partial_lines: cursors.iter().filter(|c| !c.remainder.is_empty()).count(),
+            discovering: self.discovery.active,
+            initial_load_complete: self.status.initial_load_complete
+                || (!self.discovery.active && pending_files == 0),
+            file_limit_reached: self.discovery.limited || self.files.len() >= MAX_FILES,
+            metadata_limit_reached: self.title_limit_reached,
+            unreadable_files: cursors.iter().filter(|c| c.unreadable).count(),
+            missing_roots: self.discovery.missing_roots,
+            discovery_errors: self.discovery.errors,
+            parse_errors: self.diagnostics.parse_errors,
+            invalid_records: self.diagnostics.invalid_records,
+            legacy_records: self.diagnostics.legacy_records,
+            oversized_lines: self.diagnostics.oversized_lines,
+            records_with_issues: self
+                .store
+                .calls
+                .values()
+                .filter(|c| !c.issues.is_empty())
+                .count(),
+            watcher_enabled: self.watcher.as_ref().is_some_and(WatchService::enabled),
+            watcher_errors: self.watcher.as_ref().map_or(0, |w| w.errors),
+            watcher_overflows: self.watcher.as_ref().map_or(0, |w| w.overflows),
+            scan_ms: started.elapsed().as_millis() as u64,
+            read_bytes: read_bytes as u64,
+            poll_ms: POLL_MS,
+            session_roots: self
+                .roots
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            session_index: self.index_path.to_string_lossy().into_owned(),
+            last_scan_at: Some(now.clone()),
+            last_success_at: if success {
+                Some(now)
+            } else {
+                self.status.last_success_at.clone()
+            },
         };
-        let title = inner
-            .titles
-            .get(&id)
-            .map(|t| t.title.clone())
-            .unwrap_or_else(|| "Untitled conversation".into());
-        conversations.push(Conversation {
-            id,
-            title,
-            cwd,
-            project_id,
-            project_name,
-            project_path: project_path_string,
-        });
+        let mut calls: Vec<_> = changed
+            .into_values()
+            .filter(|c| self.store.contains(&c.id))
+            .collect();
+        calls.sort_unstable_by(|a, b| (a.timestamp_ms, &a.id).cmp(&(b.timestamp_ms, &b.id)));
+        let mut removed_ids: Vec<_> = removed
+            .into_iter()
+            .filter(|id| !self.store.contains(id))
+            .collect();
+        removed_ids.sort_unstable();
+        Update {
+            revision: self.revision,
+            calls,
+            removed_ids,
+            catalog,
+            status: self.status.clone(),
+        }
     }
-    conversations.sort_by(|a, b| {
-        a.title
-            .to_lowercase()
-            .cmp(&b.title.to_lowercase())
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    let mut projects_map: HashMap<String, Project> = HashMap::new();
-    for convo in &conversations {
-        let entry = projects_map
-            .entry(convo.project_id.clone())
-            .or_insert(Project {
-                id: convo.project_id.clone(),
-                name: convo.project_name.clone(),
-                path: convo.project_path.clone(),
-                conversations: 0,
-            });
-        entry.conversations += 1;
-    }
-    let mut projects = projects_map.into_values().collect::<Vec<_>>();
-    projects.sort_by(|a, b| {
-        a.name
-            .to_lowercase()
-            .cmp(&b.name.to_lowercase())
-            .then_with(|| a.id.cmp(&b.id))
-    });
-    Catalog {
-        projects,
-        conversations,
-    }
-}
-
-fn string(value: &Value, key: &str) -> Option<String> {
-    value.get(key).and_then(Value::as_str).map(str::to_owned)
-}
-fn u64v(value: &Value, key: &str) -> u64 {
-    value.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
 
 #[cfg(test)]

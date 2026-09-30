@@ -12,9 +12,6 @@ src-tauri/gen/schemas/
 src-tauri/icons/*
 !src-tauri/icons/icon.png
 
-# Generated lockfiles are intentionally not versioned
-package-lock.json
-src-tauri/Cargo.lock
 
 # Keep legacy diagnostic data private after removing its runtime.
 .model-probes/

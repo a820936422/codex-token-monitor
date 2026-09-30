@@ -1,15 +1,18 @@
+// IPC contract: src-tauri/src/monitor/model.rs. Unknown counters are null.
+
 export interface Usage {
-  inputTokens: number;
-  cachedInputTokens: number;
-  cacheWriteInputTokens: number;
-  outputTokens: number;
-  reasoningOutputTokens: number;
-  totalTokens: number;
+  inputTokens: number | null;
+  cachedInputTokens: number | null;
+  cacheWriteInputTokens: number | null;
+  outputTokens: number | null;
+  reasoningOutputTokens: number | null;
+  totalTokens: number | null;
 }
 
 export interface CallRecord {
   id: string;
   timestamp: string;
+  timestampMs: number;
   conversationId: string;
   threadId: string;
   turnId: string | null;
@@ -18,8 +21,9 @@ export interface CallRecord {
   effort: string | null;
   serviceTier: string;
   usage: Usage;
-  freshInputTokens: number;
-  cacheHitRate: number;
+  freshInputTokens: number | null;
+  cacheHitRate: number | null;
+  issues: string[];
 }
 
 export interface Conversation {
@@ -44,19 +48,54 @@ export interface Catalog {
 }
 
 export interface MonitorStatus {
+  revision: number;
   records: number;
+  retentionLimit: number;
+  truncated: boolean;
+  oldestAt: string | null;
+  newestAt: string | null;
   conversations: number;
   projects: number;
   files: number;
+  indexedFiles: number;
+  pendingFiles: number;
+  pendingBytes: number;
+  partialLines: number;
+  discovering: boolean;
+  initialLoadComplete: boolean;
+  fileLimitReached: boolean;
+  metadataLimitReached: boolean;
+  unreadableFiles: number;
+  missingRoots: number;
+  discoveryErrors: number;
   parseErrors: number;
+  invalidRecords: number;
+  legacyRecords: number;
+  oversizedLines: number;
+  recordsWithIssues: number;
+  watcherEnabled: boolean;
+  watcherErrors: number;
+  watcherOverflows: number;
+  scanMs: number;
+  readBytes: number;
   pollMs: number;
   sessionRoots: string[];
   sessionIndex: string;
   lastScanAt: string | null;
+  lastSuccessAt: string | null;
 }
 
 export interface Snapshot {
+  revision: number;
   calls: CallRecord[];
   catalog: Catalog;
+  status: MonitorStatus;
+}
+
+export interface Update {
+  revision: number;
+  calls: CallRecord[];
+  removedIds: string[];
+  catalog: Catalog | null;
   status: MonitorStatus;
 }

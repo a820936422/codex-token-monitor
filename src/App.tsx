@@ -1,453 +1,441 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { Picker, type PickerOption } from "./components/Picker";
-import type { CallRecord, Catalog, Conversation, MonitorStatus, Snapshot } from "./types";
-
-const integer = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
-const timeFormat = new Intl.DateTimeFormat(undefined, {
-  month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
-});
-
-const COLUMN_WIDTHS_KEY = "wtm.columnWidths";
-const MAX_COLUMN_WIDTH = 720;
-const COLUMN_CONFIG = {
-  time: { defaultWidth: 145, minWidth: 110 },
-  project: { defaultWidth: 170, minWidth: 110 },
-  conversation: { defaultWidth: 320, minWidth: 190 },
-  model: { defaultWidth: 180, minWidth: 130 },
-  input: { defaultWidth: 100, minWidth: 80 },
-  cached: { defaultWidth: 100, minWidth: 80 },
-  output: { defaultWidth: 100, minWidth: 80 },
-  cache: { defaultWidth: 130, minWidth: 120 },
-} as const;
-
-type ColumnKey = keyof typeof COLUMN_CONFIG;
-type ColumnWidths = Record<ColumnKey, number>;
-const columnKeys = Object.keys(COLUMN_CONFIG) as ColumnKey[];
-
-function saved(key: string) {
-  try { return localStorage.getItem(key) || ""; } catch { return ""; }
-}
-
-function persist(key: string, value: string) {
-  try { localStorage.setItem(key, value); } catch {}
-}
-
-function defaultColumnWidths(): ColumnWidths {
-  return Object.fromEntries(columnKeys.map((key) => [key, COLUMN_CONFIG[key].defaultWidth])) as ColumnWidths;
-}
-
-function clampColumnWidth(key: ColumnKey, width: number) {
-  return Math.max(COLUMN_CONFIG[key].minWidth, Math.min(MAX_COLUMN_WIDTH, Math.round(width)));
-}
-
-function loadColumnWidths(): ColumnWidths {
-  const defaults = defaultColumnWidths();
-  const raw = saved(COLUMN_WIDTHS_KEY);
-  if (!raw) return defaults;
-  try {
-    const parsed = JSON.parse(raw) as Partial<Record<ColumnKey, unknown>>;
-    for (const key of columnKeys) {
-      if (typeof parsed[key] === "number" && Number.isFinite(parsed[key])) {
-        defaults[key] = clampColumnWidth(key, parsed[key]);
-      }
-    }
-  } catch {}
-  return defaults;
-}
-
-function persistColumnWidths(widths: ColumnWidths) {
-  persist(COLUMN_WIDTHS_KEY, JSON.stringify(widths));
-}
+import { Picker } from "./components/Picker";
+import { DateFilter } from "./components/DateFilter";
+import { Diagnostics, monitorHealth } from "./components/Diagnostics";
+import { ExportControls } from "./components/ExportControls";
+import { MonitorTable, type ViewMode } from "./components/MonitorTable";
+import { useMonitor } from "./useMonitor";
+import {
+  COLUMN_CONFIG,
+  clampColumnWidth,
+  loadColumnWidths,
+  persistColumnWidths,
+  saved,
+  persist,
+  type ColumnKey,
+} from "./columns";
+import {
+  cacheRate,
+  filterCalls,
+  filterError,
+  formatTokenTotal,
+  integer,
+  ordered,
+  recentDays,
+  summarize,
+} from "./data";
+import { formatTime } from "./format";
 
 export default function App() {
-  const [calls, setCalls] = useState<Map<string, CallRecord>>(new Map());
-  const [catalog, setCatalog] = useState<Catalog>({ projects: [], conversations: [] });
-  const [status, setStatus] = useState<MonitorStatus | null>(null);
+  const { calls, catalog, status, error, syncing, stale, retry } = useMonitor();
   const [projectId, setProjectId] = useState(() => saved("wtm.project"));
   const [conversationId, setConversationId] = useState(() => saved("wtm.conversation"));
-  const [sort, setSort] = useState<"desc" | "asc">("desc");
+  const [sort, setSort] = useState<"asc" | "desc">(() =>
+    saved("wtm.sort") === "asc" ? "asc" : "desc",
+  );
   const [dateFrom, setDateFrom] = useState(() => saved("wtm.dateFrom"));
   const [dateTo, setDateTo] = useState(() => saved("wtm.dateTo"));
-  const [columnWidths, setColumnWidths] = useState<ColumnWidths>(loadColumnWidths);
-  const [follow, setFollow] = useState(true);
-  const [live, setLive] = useState(false);
-  const [monitorError, setMonitorError] = useState(false);
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; conversationId: string } | null>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
-
+  const [widths, setWidths] = useState(loadColumnWidths);
+  const [follow, setFollow] = useState(() => saved("wtm.follow") !== "false");
+  const [view, setView] = useState<ViewMode>("calls");
+  const [preset, setPreset] = useState(() =>
+    ["full", "compact"].includes(saved("wtm.columns")) ? saved("wtm.columns") : "auto",
+  );
+  const [narrow, setNarrow] = useState(() => matchMedia("(max-width: 1100px)").matches);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; id: string } | null>(null);
+  const [copyMessage, setCopyMessage] = useState("");
+  const compact = preset === "compact" || (preset === "auto" && narrow);
+  const health = monitorHealth(status, syncing, stale, error);
   useEffect(() => {
-    let active = true;
-    let failed = false;
-    const unlisten: Array<() => void> = [];
-    // Preserve live updates that arrive while the initial snapshot is in flight.
-    let pendingCalls: Map<string, CallRecord> | null = new Map();
-    let pendingCatalog: Catalog | null = null;
-    let pendingStatus: MonitorStatus | null = null;
-    let initializing = true;
-    const release = (off: () => void) => {
-      try { void Promise.resolve(off()).catch((error) => console.error("Failed to release monitor listener", error)); }
-      catch (error) { console.error("Failed to release monitor listener", error); }
-    };
-    const dispose = () => unlisten.splice(0).forEach(release);
-    const clearPending = () => {
-      pendingCalls = null;
-      pendingCatalog = null;
-      pendingStatus = null;
-      initializing = false;
-    };
-    async function subscribe<T>(event: string, receive: (payload: T) => void) {
-      const off = await listen<T>(event, ({ payload }) => {
-        if (active && !failed) receive(payload);
-      });
-      // A sibling registration may have failed, or StrictMode may have unmounted us.
-      if (!active || failed) release(off);
-      else unlisten.push(off);
-    }
-    void (async () => {
-      await Promise.all([
-        subscribe<CallRecord>("monitor-call", (payload) => {
-          pendingCalls?.set(payload.id, payload);
-          setCalls((current) => {
-            const next = new Map(current);
-            next.set(payload.id, payload);
-            return next;
-          });
-        }),
-        subscribe<Catalog>("monitor-catalog", (payload) => {
-          if (initializing) pendingCatalog = payload;
-          setCatalog(payload);
-        }),
-        subscribe<MonitorStatus>("monitor-status", (payload) => {
-          if (initializing) pendingStatus = payload;
-          setStatus(payload);
-        }),
-      ]);
-      if (!active || failed) return;
-      const snapshot = await invoke<Snapshot>("get_snapshot");
-      if (!active || failed) return;
-      const merged = new Map(snapshot.calls.map((call) => [call.id, call]));
-      pendingCalls?.forEach((call, id) => merged.set(id, call));
-      setCalls(merged);
-      setCatalog(pendingCatalog ?? snapshot.catalog);
-      setStatus(pendingStatus ?? snapshot.status);
-      clearPending();
-      setMonitorError(false);
-      setLive(true);
-    })().catch((error) => {
-      failed = true;
-      dispose();
-      clearPending();
-      if (!active) return;
-      console.error("Failed to initialize monitor", error);
-      setMonitorError(true);
-      setLive(false);
-    });
-    return () => {
-      active = false;
-      clearPending();
-      dispose();
-    };
+    const media = matchMedia("(max-width: 1100px)");
+    const change = () => setNarrow(media.matches);
+    media.addEventListener("change", change);
+    return () => media.removeEventListener("change", change);
   }, []);
-
-  useEffect(() => {
-    if (live && projectId && !catalog.projects.some((project) => project.id === projectId)) {
-      setProjectId("");
-      persist("wtm.project", "");
-    }
-  }, [catalog.projects, projectId, live]);
-
   useEffect(() => {
     const close = () => setContextMenu(null);
-    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") close(); };
+    const key = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
     window.addEventListener("pointerdown", close);
     window.addEventListener("resize", close);
-    window.addEventListener("keydown", onKey);
+    window.addEventListener("keydown", key);
     return () => {
       window.removeEventListener("pointerdown", close);
       window.removeEventListener("resize", close);
-      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("keydown", key);
     };
   }, []);
-
-  const conversationsForProject = useMemo(() => catalog.conversations.filter((conversation) => !projectId || conversation.projectId === projectId), [catalog.conversations, projectId]);
-
+  const conversationById = useMemo(
+    () => new Map(catalog.conversations.map((c) => [c.id, c])),
+    [catalog.conversations],
+  );
+  const availableConversations = useMemo(
+    () => catalog.conversations.filter((c) => !projectId || c.projectId === projectId),
+    [catalog.conversations, projectId],
+  );
   useEffect(() => {
-    if (live && conversationId && !conversationsForProject.some((conversation) => conversation.id === conversationId)) {
+    if (syncing || !status?.initialLoadComplete || status.discovering || status.pendingFiles)
+      return;
+    const validProject = !projectId || catalog.projects.some((p) => p.id === projectId);
+    if (!validProject) {
+      setProjectId("");
+      persist("wtm.project", "");
+    }
+    const conversation = conversationById.get(conversationId);
+    if (
+      conversationId &&
+      (!conversation || (validProject && projectId && conversation.projectId !== projectId))
+    ) {
       setConversationId("");
       persist("wtm.conversation", "");
     }
-  }, [conversationId, conversationsForProject, live]);
-
-  const conversationById = useMemo(() => new Map(catalog.conversations.map((conversation) => [conversation.id, conversation])), [catalog.conversations]);
-
-  const rows = useMemo(() => {
-    const fromMs = dateBoundary(dateFrom, false);
-    const toMs = dateBoundary(dateTo, true);
-    const result = [...calls.values()].filter((call) => {
-      if (conversationId && call.conversationId !== conversationId) return false;
-      if (!conversationId && projectId && conversationById.get(call.conversationId)?.projectId !== projectId) return false;
-      const timestamp = Date.parse(call.timestamp);
-      if (fromMs !== null && (!Number.isFinite(timestamp) || timestamp < fromMs)) return false;
-      if (toMs !== null && (!Number.isFinite(timestamp) || timestamp >= toMs)) return false;
-      return true;
-    });
-    result.sort((a, b) => {
-      const delta = a.timestamp.localeCompare(b.timestamp);
-      return sort === "asc" ? delta : -delta;
-    });
-    return result;
-  }, [calls, conversationId, conversationById, dateFrom, dateTo, projectId, sort]);
-
-  useEffect(() => {
-    if (!follow || calls.size === 0) return;
-    const frame = requestAnimationFrame(() => {
-      const target = scrollRef.current;
-      if (!target) return;
-      if (sort === "desc") target.scrollTop = 0;
-      else target.scrollTop = target.scrollHeight;
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [calls.size, follow, sort]);
-
-  const chooseProject = (id: string) => {
+  }, [
+    syncing,
+    status?.initialLoadComplete,
+    status?.discovering,
+    status?.pendingFiles,
+    catalog.projects,
+    projectId,
+    conversationId,
+    conversationById,
+  ]);
+  const filters = useMemo(
+    () => ({ projectId, conversationId, from: dateFrom, to: dateTo }),
+    [projectId, conversationId, dateFrom, dateTo],
+  );
+  const filterKey = JSON.stringify(filters),
+    dateError = filterError(filters);
+  const sorted = useMemo(() => ordered(calls.values()), [calls]);
+  const filtered = useMemo(
+    () => filterCalls(sorted, filters, conversationById),
+    [sorted, filters, conversationById],
+  );
+  const rows = useMemo(
+    () => (sort === "desc" ? filtered : [...filtered].reverse()),
+    [filtered, sort],
+  );
+  const totals = useMemo(() => summarize(filtered), [filtered]);
+  const visibleConversations = useMemo(
+    () => new Set(filtered.map((c) => c.conversationId)).size,
+    [filtered],
+  );
+  const rate = cacheRate(totals),
+    newest = filtered[0];
+  const chooseProject = useCallback((id: string) => {
     setProjectId(id);
     persist("wtm.project", id);
     setConversationId("");
     persist("wtm.conversation", "");
-  };
-
-  const chooseConversation = (id: string) => {
+  }, []);
+  const chooseConversation = useCallback((id: string) => {
     setConversationId(id);
     persist("wtm.conversation", id);
+  }, []);
+  const from = (value: string) => {
+    setDateFrom(value);
+    persist("wtm.dateFrom", value);
   };
-
-  const changeDateFrom = (value: string) => { setDateFrom(value); persist("wtm.dateFrom", value); };
-  const changeDateTo = (value: string) => { setDateTo(value); persist("wtm.dateTo", value); };
-  const clearDates = () => { changeDateFrom(""); changeDateTo(""); };
-  const clearAllFilters = () => { chooseProject(""); clearDates(); };
-  const resizeColumn = (key: ColumnKey, width: number, save: boolean) => {
-    setColumnWidths((current) => {
-      const next = { ...current, [key]: clampColumnWidth(key, width) };
+  const to = (value: string) => {
+    setDateTo(value);
+    persist("wtm.dateTo", value);
+  };
+  const clearDates = () => {
+    from("");
+    to("");
+  };
+  const quickDate = (days: number) => {
+    const [a, b] = recentDays(days);
+    from(a);
+    to(b);
+  };
+  const resize = useCallback((key: ColumnKey, width: number, save: boolean) => {
+    setWidths((old) => {
+      const next = { ...old, [key]: clampColumnWidth(key, width) };
       if (save) persistColumnWidths(next);
       return next;
     });
-  };
-  const resetColumn = (key: ColumnKey) => resizeColumn(key, COLUMN_CONFIG[key].defaultWidth, true);
-
-  const openConversationMenu = (event: React.MouseEvent, id: string) => {
+  }, []);
+  const resetColumn = useCallback(
+    (key: ColumnKey) => resize(key, COLUMN_CONFIG[key].defaultWidth, true),
+    [resize],
+  );
+  const openMenu = useCallback((event: React.MouseEvent, id: string) => {
     event.preventDefault();
     event.stopPropagation();
-    const x = Math.max(8, Math.min(event.clientX, window.innerWidth - 250));
-    const y = Math.max(8, Math.min(event.clientY, window.innerHeight - 92));
-    setContextMenu({ x, y, conversationId: id });
-  };
-
-  const copyConversationId = async () => {
+    setCopyMessage("");
+    setContextMenu({
+      x: Math.max(8, Math.min(event.clientX, innerWidth - 250)),
+      y: Math.max(8, Math.min(event.clientY, innerHeight - 92)),
+      id,
+    });
+  }, []);
+  const copyId = async () => {
     if (!contextMenu) return;
-    try { await writeText(contextMenu.conversationId); }
-    catch (error) { console.error("Failed to copy conversation ID", error); }
-    finally { setContextMenu(null); }
+    try {
+      await writeText(contextMenu.id);
+      setCopyMessage("已复制会话 ID");
+    } catch {
+      setCopyMessage("复制失败，请检查桌面剪贴板权限。");
+    } finally {
+      setContextMenu(null);
+    }
   };
-
-  const projectOptions: PickerOption[] = catalog.projects.map((project) => ({
-    id: project.id,
-    primary: `${project.name} · ${project.conversations}`,
-    secondary: project.path || "未分配项目",
-  }));
-  const conversationOptions: PickerOption[] = conversationsForProject.map((conversation) => ({
-    id: conversation.id,
-    primary: conversation.title,
-    secondary: conversation.id,
-  }));
-
-  const totalInput = rows.reduce((sum, call) => sum + call.usage.inputTokens, 0);
-  const totalCached = rows.reduce((sum, call) => sum + call.usage.cachedInputTokens, 0);
-  const totalTokens = rows.reduce((sum, call) => sum + call.usage.totalTokens, 0);
-  const visibleConversations = new Set(rows.map((call) => call.conversationId)).size;
-  const newest = rows.reduce<CallRecord | null>((best, call) => !best || call.timestamp > best.timestamp ? call : best, null);
-  const tableWidth = columnKeys.reduce((sum, key) => sum + columnWidths[key], 0);
-
+  const projectOptions = useMemo(
+    () =>
+      catalog.projects.map((p) => ({
+        id: p.id,
+        primary: `${p.name} · ${p.conversations}`,
+        secondary: p.path,
+      })),
+    [catalog.projects],
+  );
+  const conversationOptions = useMemo(
+    () => availableConversations.map((c) => ({ id: c.id, primary: c.title, secondary: c.id })),
+    [availableConversations],
+  );
+  const emptyMessage =
+    error ??
+    dateError ??
+    (syncing || health === "Indexing"
+      ? "正在加载本地调用记录…"
+      : health === "Unsupported"
+        ? "发现旧累计日志，但没有兼容的逐调用记录。请查看运行诊断。"
+        : status?.missingRoots || status?.unreadableFiles
+          ? "无法完整读取日志目录，请查看运行诊断。"
+          : "当前筛选条件下还没有模型调用。");
+  const totalLabel =
+    totals.totalKnown || !totals.count
+      ? `${formatTokenTotal(totals.total)}${totals.totalKnown < totals.count ? "*" : ""}`
+      : "—";
   return (
     <main className="shell">
       <header className="topbar">
         <div>
           <p className="eyebrow">TAURI · LOCAL · READ ONLY</p>
           <h1>Work Token Monitor</h1>
-          <p className="subtitle">实时查看 ChatGPT Work / Codex 每一次模型调用的 Input、Cached、Output 与缓存命中率。</p>
+          <p className="subtitle">只读本地日志，查看每次调用的 token 用量与缓存命中率。</p>
         </div>
-        <div className={`live-badge ${live ? "live" : "connecting"}`}><span className="dot" /><span>{live ? "Live" : monitorError ? "Error" : "Starting"}</span></div>
+        <div
+          className={`live-badge ${health === "Live" ? "live" : "connecting"}`}
+          title="表示监控状态，不表示模型服务或账号状态"
+        >
+          <span className="dot" />
+          <span>{health}</span>
+        </div>
       </header>
-
       <section className="toolbar" aria-label="Filters">
-        <Picker label="Project" selectedId={projectId} allLabel="All Projects" allSecondary={`${catalog.projects.length} 个项目`} options={projectOptions} onSelect={chooseProject} />
-        <Picker label="Conversation" selectedId={conversationId} allLabel="All Conversations" allSecondary={`${conversationsForProject.length} 个会话`} options={conversationOptions} wide onSelect={chooseConversation} />
-        <label className="field compact-field"><span>Sort</span><select aria-label="Sort" value={sort} onChange={(event) => setSort(event.target.value as "asc" | "desc")}><option value="desc">最新优先</option><option value="asc">最早优先</option></select></label>
-        <label className="toggle-field"><input type="checkbox" checked={follow} onChange={(event) => setFollow(event.target.checked)} /><span>Follow latest</span></label>
-        <button className="ghost-button" type="button" onClick={clearAllFilters}>清除筛选</button>
+        <Picker
+          label="Project"
+          selectedId={projectId}
+          allLabel="All Projects"
+          allSecondary={`${catalog.projects.length} 个已加载项目`}
+          options={projectOptions}
+          onSelect={chooseProject}
+        />
+        <Picker
+          label="Conversation"
+          selectedId={conversationId}
+          allLabel="All Conversations"
+          allSecondary={`${availableConversations.length} 个已加载会话`}
+          options={conversationOptions}
+          wide
+          onSelect={chooseConversation}
+        />
+        <label className="field compact-field">
+          <span>Sort</span>
+          <select
+            aria-label="Sort"
+            value={sort}
+            onChange={(e) => {
+              const v = e.target.value as "asc" | "desc";
+              setSort(v);
+              persist("wtm.sort", v);
+            }}
+          >
+            <option value="desc">最新优先</option>
+            <option value="asc">最早优先</option>
+          </select>
+        </label>
+        <label className="toggle-field">
+          <input
+            type="checkbox"
+            checked={follow}
+            onChange={(e) => {
+              setFollow(e.target.checked);
+              persist("wtm.follow", String(e.target.checked));
+            }}
+          />
+          <span>Follow latest</span>
+        </label>
+        <button
+          className="ghost-button"
+          onClick={() => {
+            chooseProject("");
+            clearDates();
+          }}
+        >
+          清除筛选
+        </button>
       </section>
-
-
+      <section className="view-toolbar" aria-label="视图与导出">
+        <div className="date-presets">
+          <button onClick={() => quickDate(1)}>今天</button>
+          <button onClick={() => quickDate(7)}>近 7 天</button>
+          <button onClick={() => quickDate(30)}>近 30 天</button>
+          <button onClick={clearDates}>全部已加载日期</button>
+          <DateFilter from={dateFrom} to={dateTo} onFrom={from} onTo={to} onClear={clearDates} />
+        </div>
+        <label>
+          视图
+          <select
+            aria-label="视图"
+            value={view}
+            onChange={(e) => setView(e.target.value as ViewMode)}
+          >
+            <option value="calls">逐调用</option>
+            <option value="project">项目汇总</option>
+            <option value="conversation">会话汇总</option>
+          </select>
+        </label>
+        <label>
+          列显示
+          <select
+            aria-label="列显示"
+            value={preset}
+            onChange={(e) => {
+              setPreset(e.target.value);
+              persist("wtm.columns", e.target.value);
+            }}
+          >
+            <option value="auto">自适应</option>
+            <option value="full">全部列</option>
+            <option value="compact">紧凑列</option>
+          </select>
+        </label>
+        <ExportControls
+          calls={rows}
+          conversations={conversationById}
+          status={status}
+          filters={filters}
+          disabled={syncing || stale || Boolean(error || dateError)}
+        />
+      </section>
+      <div className="scope-note">
+        <strong>
+          当前加载窗口：{integer.format(status?.records ?? 0)} /{" "}
+          {integer.format(status?.retentionLimit ?? 50000)} 条
+        </strong>
+        <span>
+          {status?.oldestAt && status.newestAt
+            ? `${formatTime(status.oldestAt)} — ${formatTime(status.newestAt)}`
+            : "尚无时间覆盖范围"}
+        </span>
+        <span>
+          {status?.truncated
+            ? "已截断：仅保留按时间排序的最近记录，不是完整历史总量。"
+            : "统计只覆盖当前加载记录，不是完整历史账单。"}
+        </span>
+        {(status?.discovering || Boolean(status?.pendingFiles)) && (
+          <span>索引进行中，范围可能继续变化。</span>
+        )}
+        {(dateFrom || dateTo) && (
+          <span>
+            日期筛选：{dateFrom || "不限"} — {dateTo || "不限"}（本地时区）
+          </span>
+        )}
+      </div>
+      {(error || stale || dateError) && (
+        <div className="warning-banner" role="alert">
+          {error ?? dateError ?? "监控心跳已超过 5 秒未更新，当前数据可能过期。"}
+          {(error || stale) && (
+            <button className="ghost-button" onClick={retry}>
+              重新同步
+            </button>
+          )}
+        </div>
+      )}
       <section className="summary" aria-label="Summary">
-        <div><span>Visible calls</span><strong>{integer.format(rows.length)}</strong></div>
-        <div><span>Conversations</span><strong>{integer.format(visibleConversations)}</strong></div>
-        <div title={`${integer.format(totalTokens)} tokens`}><span>Total tokens</span><strong>{formatTokenTotal(totalTokens)}</strong></div>
-        <div><span>Average cache hit</span><strong>{totalInput ? `${(totalCached / totalInput * 100).toFixed(1)}%` : "—"}</strong></div>
-        <div><span>Last update</span><strong>{newest ? formatTime(newest.timestamp) : "—"}</strong></div>
-      </section>
-
-      <section className="table-card">
-        <div className="table-scroll" ref={scrollRef}>
-          <table style={{ width: `max(100%, ${tableWidth}px)` }}>
-            <colgroup>
-              {columnKeys.map((key) => <col key={key} style={{ width: columnWidths[key] }} />)}
-            </colgroup>
-            <thead><tr>
-              <ColumnHeader column="time" width={columnWidths.time} onResize={resizeColumn} onReset={resetColumn}><DateFilter from={dateFrom} to={dateTo} onFrom={changeDateFrom} onTo={changeDateTo} onClear={clearDates} /></ColumnHeader>
-              <ColumnHeader column="project" width={columnWidths.project} onResize={resizeColumn} onReset={resetColumn}>Project</ColumnHeader>
-              <ColumnHeader column="conversation" width={columnWidths.conversation} onResize={resizeColumn} onReset={resetColumn}>Conversation</ColumnHeader>
-              <ColumnHeader column="model" width={columnWidths.model} onResize={resizeColumn} onReset={resetColumn}><span title="Codex 日志记录的模型名称，不代表独立验证过的后端模型身份">日志模型</span></ColumnHeader>
-              <ColumnHeader column="input" width={columnWidths.input} numeric onResize={resizeColumn} onReset={resetColumn}>Input</ColumnHeader>
-              <ColumnHeader column="cached" width={columnWidths.cached} numeric onResize={resizeColumn} onReset={resetColumn}>Cached</ColumnHeader>
-              <ColumnHeader column="output" width={columnWidths.output} numeric onResize={resizeColumn} onReset={resetColumn}>Output</ColumnHeader>
-              <ColumnHeader column="cache" width={columnWidths.cache} numeric onResize={resizeColumn} onReset={resetColumn}>Cache hit</ColumnHeader>
-            </tr></thead>
-            <tbody>
-              {rows.map((call) => <CallRow key={call.id} call={call} conversation={conversationById.get(call.conversationId)} onConversation={chooseConversation} onProject={chooseProject} onConversationMenu={openConversationMenu} />)}
-            </tbody>
-          </table>
-          {rows.length === 0 && <div className="empty-state" role="status">{monitorError ? "监控初始化失败，请重启后重试。" : !live ? "正在加载本地调用记录…" : "当前筛选条件下还没有模型调用。"}</div>}
+        <div>
+          <span>Visible calls</span>
+          <strong>{integer.format(rows.length)}</strong>
+          <small>当前筛选范围</small>
+        </div>
+        <div>
+          <span>Conversations</span>
+          <strong>{integer.format(visibleConversations)}</strong>
+          <small>已加载会话</small>
+        </div>
+        <div title={`${integer.format(totals.total)} tokens`}>
+          <span>Total tokens</span>
+          <strong>{totalLabel}</strong>
+          <small>
+            有值 {totals.totalKnown} / {totals.count}；* 为已知部分小计
+          </small>
+        </div>
+        <div>
+          <span>Average cache hit</span>
+          <strong>
+            {rate === null
+              ? "—"
+              : `${rate.toFixed(1)}%${totals.cachePairs < totals.count ? "*" : ""}`}
+          </strong>
+          <small>
+            按输入加权；配对字段 {totals.cachePairs} / {totals.count}
+          </small>
+        </div>
+        <div title={newest?.timestamp}>
+          <span>Last update</span>
+          <strong>{newest ? formatTime(newest.timestamp) : "—"}</strong>
+          <small>最新调用时间，不是扫描心跳</small>
         </div>
       </section>
-
+      {totals.issues > 0 && (
+        <p className="quality-note">
+          当前筛选中 {totals.issues}{" "}
+          条记录存在缺失字段或异常；“—”表示未知，不作为零值参与汇总。悬停日志模型可查看问题代码。
+        </p>
+      )}
+      <MonitorTable
+        rows={rows}
+        conversations={conversationById}
+        view={view}
+        compact={compact}
+        widths={widths}
+        follow={follow}
+        sort={sort}
+        filterKey={filterKey}
+        emptyMessage={emptyMessage}
+        onResize={resize}
+        onReset={resetColumn}
+        onProject={chooseProject}
+        onConversation={chooseConversation}
+        onMenu={openMenu}
+      />
+      <Diagnostics status={status} />
       <footer>
-        <span>{status ? `Rust 监控 · ${status.files} files · ${status.pollMs} ms polling · ${status.parseErrors} errors` : "正在初始化 Rust 监控…"}</span>
-        <span>仅读取本地日志 · 不读取 auth.json · 不修改 Codex 配置 · 不上传数据</span>
+        <span>
+          {status
+            ? `Rust · ${status.files} files · ${status.scanMs} ms / scan · revision ${status.revision}`
+            : "正在初始化 Rust 监控…"}
+        </span>
+        <span>仅读取本地日志 · 不读取认证 · 不修改 Codex 配置 · 导出需手动选择文件</span>
       </footer>
-
+      <p className="copy-feedback" aria-live="polite">
+        {copyMessage}
+      </p>
       {contextMenu && (
-        <div className="conversation-context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} onPointerDown={(event) => event.stopPropagation()} onContextMenu={(event) => event.preventDefault()}>
-          <button type="button" onClick={() => void copyConversationId()}>复制会话 ID</button>
-          <small>{contextMenu.conversationId}</small>
+        <div
+          className="conversation-context-menu"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onPointerDown={(e) => e.stopPropagation()}
+          onContextMenu={(e) => e.preventDefault()}
+        >
+          <button onClick={() => void copyId()}>复制会话 ID</button>
+          <small>{contextMenu.id}</small>
         </div>
       )}
     </main>
   );
-}
-
-function ColumnHeader({ column, width, numeric = false, children, onResize, onReset }: { column: ColumnKey; width: number; numeric?: boolean; children: React.ReactNode; onResize: (key: ColumnKey, width: number, save: boolean) => void; onReset: (key: ColumnKey) => void }) {
-  const config = COLUMN_CONFIG[column];
-  const beginResize = (event: React.PointerEvent<HTMLSpanElement>) => {
-    if (event.button !== 0) return;
-    event.preventDefault();
-    event.stopPropagation();
-    const target = event.currentTarget;
-    const pointerId = event.pointerId;
-    const startX = event.clientX;
-    const startWidth = width;
-    let latestWidth = width;
-    document.body.classList.add("column-resizing");
-    target.setPointerCapture(pointerId);
-    const move = (moveEvent: PointerEvent) => {
-      latestWidth = clampColumnWidth(column, startWidth + moveEvent.clientX - startX);
-      onResize(column, latestWidth, false);
-    };
-    const finish = () => {
-      if (target.hasPointerCapture(pointerId)) target.releasePointerCapture(pointerId);
-      target.removeEventListener("pointermove", move);
-      target.removeEventListener("pointerup", finish);
-      target.removeEventListener("pointercancel", finish);
-      document.body.classList.remove("column-resizing");
-      onResize(column, latestWidth, true);
-    };
-    target.addEventListener("pointermove", move);
-    target.addEventListener("pointerup", finish);
-    target.addEventListener("pointercancel", finish);
-  };
-  const changeWithKeyboard = (event: React.KeyboardEvent<HTMLSpanElement>) => {
-    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
-    event.preventDefault();
-    const step = event.shiftKey ? 25 : 10;
-    onResize(column, width + (event.key === "ArrowRight" ? step : -step), true);
-  };
-  return (
-    <th className={`resizable-header${numeric ? " numeric" : ""}`}>
-      {children}
-      <span
-        className="column-resizer"
-        role="separator"
-        aria-label={`调整 ${column} 列宽`}
-        aria-orientation="vertical"
-        aria-valuemin={config.minWidth}
-        aria-valuemax={MAX_COLUMN_WIDTH}
-        aria-valuenow={width}
-        tabIndex={0}
-        title="拖动调整列宽；双击恢复默认宽度"
-        onPointerDown={beginResize}
-        onDoubleClick={() => onReset(column)}
-        onKeyDown={changeWithKeyboard}
-      />
-    </th>
-  );
-}
-
-function formatTokenTotal(value: number) {
-  if (value < 1_000) return integer.format(value);
-  const units: Array<[number, string]> = [[1_000_000_000, "B"], [1_000_000, "M"], [1_000, "K"]];
-  const [divisor, suffix] = units.find(([divisor]) => value >= divisor) ?? units[units.length - 1];
-  const scaled = value / divisor;
-  const digits = scaled >= 100 ? 0 : scaled >= 10 ? 1 : 2;
-  return `${scaled.toFixed(digits).replace(/\.0+$|(?<=\.[0-9])0+$/, "")}${suffix}`;
-}
-
-function formatEffort(value: string) {
-  const normalized = value.trim().toLowerCase();
-  if (normalized === "xhigh" || normalized === "extra_high" || normalized === "extra-high") return "Extra High";
-  return normalized.split(/[_-]+/).filter(Boolean).map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(" ") || value;
-}
-
-function CallRow({ call, conversation, onConversation, onProject, onConversationMenu }: { call: CallRecord; conversation?: Conversation; onConversation: (id: string) => void; onProject: (id: string) => void; onConversationMenu: (event: React.MouseEvent, id: string) => void }) {
-  return (
-    <tr>
-      <td className="time-cell" title={call.timestamp}>{formatTime(call.timestamp)}</td>
-      <td className="project-cell"><button className="plain-filter-button" type="button" onClick={() => conversation && onProject(conversation.projectId)}>{conversation?.projectName || "Unassigned"}</button></td>
-      <td className="conversation-cell"><button className="conversation-button" type="button" onClick={() => onConversation(call.conversationId)} onContextMenu={(event) => onConversationMenu(event, call.conversationId)} title={`${call.conversationId} · 右键复制 ID`}><strong>{conversation?.title || "Untitled conversation"}</strong><small>{call.conversationId}</small></button></td>
-      <td className="model-cell" title={call.effort ? `Reasoning effort: ${formatEffort(call.effort)}` : undefined}>
-        <div className="model-stack"><strong>{call.model || "unknown"}</strong>{call.effort && <small>{formatEffort(call.effort)}</small>}</div>
-      </td>
-      <td className="numeric token-input">{integer.format(call.usage.inputTokens)}</td>
-      <td className="numeric token-cached">{integer.format(call.usage.cachedInputTokens)}</td>
-      <td className="numeric token-output">{integer.format(call.usage.outputTokens)}</td>
-      <td className="numeric cache-cell"><span className="cache-meter" style={{ "--cache": `${Math.max(0, Math.min(100, call.cacheHitRate))}%` } as React.CSSProperties} /><strong>{call.cacheHitRate.toFixed(2)}%</strong></td>
-    </tr>
-  );
-}
-
-function DateFilter({ from, to, onFrom, onTo, onClear }: { from: string; to: string; onFrom: (value: string) => void; onTo: (value: string) => void; onClear: () => void }) {
-  const active = Boolean(from || to);
-  return (
-    <details className={`date-filter${active ? " active" : ""}`}>
-      <summary title="筛选日期范围"><span>Time</span><span className="date-filter-arrow">▾</span></summary>
-      <div className="date-filter-menu" onClick={(event) => event.stopPropagation()}>
-        <label><span>From</span><input type="date" value={from} onChange={(event) => onFrom(event.target.value)} /></label>
-        <label><span>To</span><input type="date" value={to} onChange={(event) => onTo(event.target.value)} /></label>
-        <button type="button" onClick={onClear} disabled={!active}>清除日期</button>
-      </div>
-    </details>
-  );
-}
-
-function dateBoundary(value: string, exclusiveEnd: boolean) {
-  if (!value) return null;
-  const date = new Date(`${value}T00:00:00`);
-  if (Number.isNaN(date.getTime())) return null;
-  if (exclusiveEnd) date.setDate(date.getDate() + 1);
-  return date.getTime();
-}
-
-function formatTime(timestamp: string) {
-  const date = new Date(timestamp);
-  return Number.isNaN(date.getTime()) ? timestamp || "—" : timeFormat.format(date);
 }

@@ -1,5 +1,7 @@
 # Token-only 版本移除与项目检查报告
 
+> Historical pre-optimization review. See [the implemented optimization report](optimization-2026-09-23.md) for the subsequent changes and verification.
+
 检查日期：2026-09-23。基线提交：`c84769832d27234af9bae99eccdd1581580ebfa2`。
 
 ## 1. 本次变更范围
